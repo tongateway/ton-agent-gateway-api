@@ -1,0 +1,634 @@
+import {
+  buildSignedTransferMessage,
+  wrapSignedBodyIntoExternalMessage,
+} from './services/tonMessage';
+import { SignAndExecuteSchema, ExecuteSignedSchema, RawExecuteSchema } from './schemas/tx';
+import { resolveSecretKeyFromHex } from './utils/keys';
+import { toSafeNumber } from './utils/numbers';
+import { CreateJettonOrderSchema, CreateTonOrderSchema, SafeCreateTonOrderSchema, SafeCreateJettonOrderSchema } from './schemas/open4dev';
+import { buildCreateJettonOrderMessage, buildCreateTonOrderMessage, buildTonOrderPayload, buildJettonOrderPayload } from './services/open4devOrderBook';
+
+interface Env {
+  TON_BROADCAST_URL?: string;
+  TON_API_KEY?: string;
+  TON_API_KEY_HEADER?: string;
+  JWT_SECRET?: string;
+  PENDING_STORE: KVNamespace;
+}
+
+// --- CORS ---
+
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+function html(body: string): Response {
+  return new Response(body, {
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+// --- JWT (HS256 via Web Crypto) ---
+
+const encoder = new TextEncoder();
+
+async function jwtSign(payload: Record<string, unknown>, secret: string): Promise<string> {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { ...payload, iat: now };
+
+  const b64Header = btoa(JSON.stringify(header)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const b64Payload = btoa(JSON.stringify(claims)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const data = `${b64Header}.${b64Payload}`;
+
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
+  const b64Sig = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+
+  return `${data}.${b64Sig}`;
+}
+
+async function jwtVerify(token: string, secret: string): Promise<Record<string, unknown> | null> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+
+  const data = `${parts[0]}.${parts[1]}`;
+  const sig = Uint8Array.from(atob(parts[2].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  const valid = await crypto.subtle.verify('HMAC', key, sig, encoder.encode(data));
+  if (!valid) return null;
+
+  const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
+
+  return payload;
+}
+
+async function authenticate(request: Request, env: Env): Promise<{ address: string; sessionId: string } | null> {
+  const auth = request.headers.get('Authorization');
+  if (!auth?.startsWith('Bearer ')) return null;
+
+  const payload = await jwtVerify(auth.slice(7), env.JWT_SECRET ?? 'change-me-in-production');
+  if (!payload || typeof payload.address !== 'string' || typeof payload.sid !== 'string') return null;
+
+  // Check session is not revoked
+  const session = await env.PENDING_STORE.get(`ses:${payload.sid}`);
+  if (!session) return null;
+
+  return { address: payload.address, sessionId: payload.sid };
+}
+
+// --- Session Store (KV-backed) ---
+
+interface Session {
+  sid: string;
+  address: string;
+  label: string;
+  createdAt: number;
+}
+
+async function createSession(kv: KVNamespace, sid: string, address: string, label: string): Promise<Session> {
+  const session: Session = { sid, address, label, createdAt: Date.now() };
+  await kv.put(`ses:${sid}`, JSON.stringify(session));
+  await kv.put(`sidx:${address}:${sid}`, sid);
+  return session;
+}
+
+async function listSessions(kv: KVNamespace, address: string): Promise<Session[]> {
+  const list = await kv.list({ prefix: `sidx:${address}:` });
+  const sessions: Session[] = [];
+  for (const key of list.keys) {
+    const sid = key.name.split(':').pop();
+    const raw = await kv.get(`ses:${sid}`);
+    if (raw) sessions.push(JSON.parse(raw));
+  }
+  return sessions;
+}
+
+async function revokeSession(kv: KVNamespace, sid: string, address: string): Promise<boolean> {
+  const raw = await kv.get(`ses:${sid}`);
+  if (!raw) return false;
+  const session: Session = JSON.parse(raw);
+  if (session.address !== address) return false;
+  await kv.delete(`ses:${sid}`);
+  await kv.delete(`sidx:${address}:${sid}`);
+  return true;
+}
+
+async function revokeAllSessions(kv: KVNamespace, address: string, exceptSid: string): Promise<number> {
+  const sessions = await listSessions(kv, address);
+  let count = 0;
+  for (const s of sessions) {
+    if (s.sid === exceptSid) continue;
+    await kv.delete(`ses:${s.sid}`);
+    await kv.delete(`sidx:${address}:${s.sid}`);
+    count++;
+  }
+  return count;
+}
+
+async function findSessionByLabel(kv: KVNamespace, address: string, label: string): Promise<Session | null> {
+  const sessions = await listSessions(kv, address);
+  return sessions.find(s => s.label === label) ?? null;
+}
+
+// --- Pending Store (KV-backed) ---
+
+interface PendingRequest {
+  id: string;
+  sessionId: string;
+  walletAddress: string;
+  type: 'transfer';
+  to: string;
+  amountNano: string;
+  payloadBoc?: string;
+  status: 'pending' | 'confirmed' | 'rejected' | 'expired';
+  createdAt: number;
+  expiresAt: number;
+  txHash?: string;
+}
+
+const TTL_SEC = 5 * 60; // 5 minutes
+
+async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress: string, to: string, amountNano: string, payloadBoc?: string): Promise<PendingRequest> {
+  const now = Date.now();
+  const req: PendingRequest = {
+    id: crypto.randomUUID(),
+    sessionId,
+    walletAddress,
+    type: 'transfer',
+    to,
+    amountNano,
+    payloadBoc,
+    status: 'pending',
+    createdAt: now,
+    expiresAt: now + TTL_SEC * 1000,
+  };
+  await kv.put(`req:${req.id}`, JSON.stringify(req), { expirationTtl: TTL_SEC });
+  // Index by sessionId so the token holder can list their own requests
+  await kv.put(`idx:${sessionId}:${req.id}`, req.id, { expirationTtl: TTL_SEC });
+  // Index by wallet address so the dashboard can list ALL pending for this wallet
+  await kv.put(`widx:${walletAddress}:${req.id}`, req.id, { expirationTtl: TTL_SEC });
+  return req;
+}
+
+async function kvGetPending(kv: KVNamespace, sessionId: string): Promise<PendingRequest[]> {
+  const list = await kv.list({ prefix: `idx:${sessionId}:` });
+  const results: PendingRequest[] = [];
+  for (const key of list.keys) {
+    const raw = await kv.get(`req:${key.name.split(':').pop()}`);
+    if (!raw) continue;
+    const req: PendingRequest = JSON.parse(raw);
+    if (req.status === 'pending') results.push(req);
+  }
+  return results;
+}
+
+async function kvGetPendingByWallet(kv: KVNamespace, walletAddress: string): Promise<PendingRequest[]> {
+  const list = await kv.list({ prefix: `widx:${walletAddress}:` });
+  const results: PendingRequest[] = [];
+  for (const key of list.keys) {
+    const raw = await kv.get(`req:${key.name.split(':').pop()}`);
+    if (!raw) continue;
+    const req: PendingRequest = JSON.parse(raw);
+    if (req.status === 'pending') results.push(req);
+  }
+  return results;
+}
+
+async function kvGetById(kv: KVNamespace, id: string, sessionId: string): Promise<PendingRequest | null> {
+  const raw = await kv.get(`req:${id}`);
+  if (!raw) return null;
+  const req: PendingRequest = JSON.parse(raw);
+  if (req.sessionId !== sessionId) return null;
+  return req;
+}
+
+async function kvGetByIdForWallet(kv: KVNamespace, id: string, walletAddress: string): Promise<PendingRequest | null> {
+  const raw = await kv.get(`req:${id}`);
+  if (!raw) return null;
+  const req: PendingRequest = JSON.parse(raw);
+  if (req.walletAddress !== walletAddress) return null;
+  return req;
+}
+
+async function kvUpdate(kv: KVNamespace, req: PendingRequest): Promise<void> {
+  await kv.put(`req:${req.id}`, JSON.stringify(req), { expirationTtl: 3600 });
+}
+
+// --- Helpers ---
+
+function swaggerHtml(openapiUrl: string): string {
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Gateway API Swagger</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+    <style>body { margin: 0; } #swagger-ui { max-width: 1200px; margin: 0 auto; }</style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        url: '${openapiUrl}',
+        dom_id: '#swagger-ui'
+      });
+    </script>
+  </body>
+</html>`;
+}
+
+async function broadcastViaEnv(externalMessageBoc: string, env: Env) {
+  const tonBroadcastUrl = env.TON_BROADCAST_URL ?? 'https://testnet.toncenter.com/api/v2/sendBoc';
+  const tonApiKeyHeader = env.TON_API_KEY_HEADER ?? 'X-API-Key';
+
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (env.TON_API_KEY) headers[tonApiKeyHeader] = env.TON_API_KEY;
+
+  const response = await fetch(tonBroadcastUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ boc: externalMessageBoc }),
+  });
+
+  const raw = await response.text();
+  let body: unknown = raw;
+  try { body = JSON.parse(raw); } catch {}
+
+  if (!response.ok) {
+    throw new Error(`Broadcast failed (${response.status}): ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+  }
+
+  return { status: response.status, body };
+}
+
+async function parseJson(request: Request): Promise<unknown> {
+  try { return await request.json(); }
+  catch { throw new Error('Invalid JSON body'); }
+}
+
+// --- Worker ---
+
+const OPENAPI_SPEC = {
+  openapi: '3.1.0',
+  info: { title: 'Agent Gateway API (Worker)', version: '0.2.0' },
+  paths: {
+    '/health': { get: { summary: 'Health check' } },
+    '/v1/auth/token': { post: { summary: 'Get auth token' } },
+    '/v1/auth/me': { get: { summary: 'Verify token' } },
+    '/v1/tx/sign-and-execute': { post: { summary: 'Sign transfer and execute' } },
+    '/v1/tx/execute-signed': { post: { summary: 'Execute signed body' } },
+    '/v1/tx/raw-execute': { post: { summary: 'Execute raw external BOC' } },
+    '/v1/safe/tx/transfer': { post: { summary: 'Request a safe transfer' } },
+    '/v1/safe/tx/pending': { get: { summary: 'List pending requests' } },
+    '/v1/safe/tx/:id': { get: { summary: 'Get request by ID' } },
+    '/v1/safe/tx/:id/confirm': { post: { summary: 'Confirm pending request' } },
+    '/v1/safe/tx/:id/reject': { post: { summary: 'Reject pending request' } },
+    '/v1/open4dev/orders/create-ton': { post: { summary: 'Create TON order for open4dev order-book' } },
+    '/v1/open4dev/orders/create-jetton': { post: { summary: 'Create Jetton order for open4dev order-book' } },
+    '/v1/safe/open4dev/orders/create-ton': { post: { summary: 'Safe-mode: create TON order (pending approval)' } },
+    '/v1/safe/open4dev/orders/create-jetton': { post: { summary: 'Safe-mode: create Jetton order (pending approval)' } },
+  },
+};
+
+const handler: ExportedHandler<Env> = {
+  async fetch(request, env) {
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // --- Static / docs ---
+
+    if (request.method === 'GET' && path === '/health') {
+      return json({ ok: true });
+    }
+
+    if (request.method === 'GET' && path === '/openapi.json') {
+      return json(OPENAPI_SPEC);
+    }
+
+    if (request.method === 'GET' && (path === '/docs' || path === '/docs/')) {
+      return html(swaggerHtml(new URL('/openapi.json', request.url).toString()));
+    }
+
+    try {
+      // --- Auth ---
+
+      if (request.method === 'POST' && path === '/v1/auth/token') {
+        const body = await parseJson(request) as Record<string, unknown>;
+        const address = body.address;
+        if (!address || typeof address !== 'string' || address.length < 10) {
+          return json({ error: 'Invalid address' }, 400);
+        }
+        const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : 'default';
+        const reuse = body.reuse === true;
+        const secret = env.JWT_SECRET ?? 'change-me-in-production';
+
+        // If reuse flag is set, try to find an existing session with the same label
+        if (reuse) {
+          const existing = await findSessionByLabel(env.PENDING_STORE, address, label);
+          if (existing) {
+            const token = await jwtSign({ address, sid: existing.sid }, secret);
+            return json({ token, address, sessionId: existing.sid, label: existing.label });
+          }
+        }
+
+        const sid = crypto.randomUUID();
+        const token = await jwtSign({ address, sid }, secret);
+        await createSession(env.PENDING_STORE, sid, address, label);
+        return json({ token, address, sessionId: sid, label });
+      }
+
+      if (request.method === 'GET' && path === '/v1/auth/me') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        return json({ address: user.address, sessionId: user.sessionId });
+      }
+
+      if (request.method === 'GET' && path === '/v1/auth/sessions') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        return json({ sessions: await listSessions(env.PENDING_STORE, user.address) });
+      }
+
+      if (request.method === 'POST' && path === '/v1/auth/revoke') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        const body = await parseJson(request) as Record<string, unknown>;
+        const sid = body.sessionId;
+        if (!sid || typeof sid !== 'string') {
+          return json({ error: 'Missing sessionId' }, 400);
+        }
+        if (sid === user.sessionId) {
+          return json({ error: 'Cannot revoke your own active session' }, 400);
+        }
+        const ok = await revokeSession(env.PENDING_STORE, sid, user.address);
+        if (!ok) return json({ error: 'Session not found' }, 404);
+        return json({ revoked: true, sessionId: sid });
+      }
+
+      if (request.method === 'POST' && path === '/v1/auth/revoke-all') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        const count = await revokeAllSessions(env.PENDING_STORE, user.address, user.sessionId);
+        return json({ revoked: count });
+      }
+
+      // --- Safe TX ---
+
+      if (request.method === 'POST' && path === '/v1/safe/tx/transfer') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const to = body.to;
+        const amountNano = body.amountNano;
+        if (!to || typeof to !== 'string' || !amountNano || typeof amountNano !== 'string') {
+          return json({ error: 'Missing required fields: to, amountNano' }, 400);
+        }
+
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, typeof body.payloadBoc === 'string' ? body.payloadBoc : undefined);
+        return json(req);
+      }
+
+      if (request.method === 'GET' && path === '/v1/safe/tx/pending') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        // Return ALL pending requests for this wallet (across all sessions)
+        return json({ requests: await kvGetPendingByWallet(env.PENDING_STORE, user.address) });
+      }
+
+      // Match /v1/safe/tx/:id, /v1/safe/tx/:id/confirm, /v1/safe/tx/:id/reject
+      const safeTxMatch = path.match(/^\/v1\/safe\/tx\/([^/]+)(\/confirm|\/reject)?$/);
+      if (safeTxMatch) {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const id = safeTxMatch[1];
+        const action = safeTxMatch[2]; // /confirm, /reject, or undefined
+
+        if (!action && request.method === 'GET') {
+          // Allow viewing any request belonging to the same wallet
+          const req = await kvGetByIdForWallet(env.PENDING_STORE, id, user.address);
+          if (!req) return json({ error: 'Not found' }, 404);
+          return json(req);
+        }
+
+        if (action === '/confirm' && request.method === 'POST') {
+          const req = await kvGetByIdForWallet(env.PENDING_STORE, id, user.address);
+          if (!req) return json({ error: 'Not found' }, 404);
+          if (req.status !== 'pending') return json({ error: 'Request is not pending' }, 400);
+
+          let txHash: string | undefined;
+          try {
+            const body = await parseJson(request) as Record<string, unknown>;
+            if (typeof body.txHash === 'string') txHash = body.txHash;
+          } catch {}
+
+          req.status = 'confirmed';
+          req.txHash = txHash;
+          await kvUpdate(env.PENDING_STORE, req);
+          return json(req);
+        }
+
+        if (action === '/reject' && request.method === 'POST') {
+          const req = await kvGetByIdForWallet(env.PENDING_STORE, id, user.address);
+          if (!req) return json({ error: 'Not found' }, 404);
+          if (req.status !== 'pending') return json({ error: 'Request is not pending' }, 400);
+          req.status = 'rejected';
+          await kvUpdate(env.PENDING_STORE, req);
+          return json(req);
+        }
+      }
+
+      // --- Safe Open4dev Orders ---
+
+      if (request.method === 'POST' && path === '/v1/safe/open4dev/orders/create-ton') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const input = SafeCreateTonOrderSchema.parse(await parseJson(request));
+        const order = buildTonOrderPayload({
+          dexVaultTonAddress: input.dexVaultTonAddress,
+          sendValueNano: input.sendValueNano,
+          orderAmountNano: input.orderAmountNano,
+          priceRateNano: input.priceRateNano,
+          slippage: toSafeNumber(input.slippage),
+          toJettonMinter: input.toJettonMinter,
+          providerFeeAddress: input.providerFeeAddress,
+          feeNum: toSafeNumber(input.feeNum),
+          feeDenom: toSafeNumber(input.feeDenom),
+          matcherFeeNum: toSafeNumber(input.matcherFeeNum),
+          matcherFeeDenom: toSafeNumber(input.matcherFeeDenom),
+          oppositeVaultAddress: input.oppositeVaultAddress,
+          createdAt: input.createdAt !== undefined ? toSafeNumber(input.createdAt) : undefined,
+        });
+
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, order.to, order.amountNano, order.payloadBoc);
+        return json(req);
+      }
+
+      if (request.method === 'POST' && path === '/v1/safe/open4dev/orders/create-jetton') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const input = SafeCreateJettonOrderSchema.parse(await parseJson(request));
+        const order = buildJettonOrderPayload({
+          jettonWalletAddress: input.jettonWalletAddress,
+          attachedTonAmountNano: input.attachedTonAmountNano,
+          jettonAmountNano: input.jettonAmountNano,
+          dexVaultAddress: input.dexVaultAddress,
+          ownerAddress: input.ownerAddress,
+          forwardTonAmountNano: input.forwardTonAmountNano,
+          priceRateNano: input.priceRateNano,
+          slippage: toSafeNumber(input.slippage),
+          toJettonMinter: input.toJettonMinter,
+          providerFeeAddress: input.providerFeeAddress,
+          feeNum: toSafeNumber(input.feeNum),
+          feeDenom: toSafeNumber(input.feeDenom),
+          matcherFeeNum: toSafeNumber(input.matcherFeeNum),
+          matcherFeeDenom: toSafeNumber(input.matcherFeeDenom),
+          oppositeVaultAddress: input.oppositeVaultAddress,
+          customPayloadBoc: input.customPayloadBoc,
+          createdAt: input.createdAt !== undefined ? toSafeNumber(input.createdAt) : undefined,
+          queryId: input.queryId,
+        });
+
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, order.to, order.amountNano, order.payloadBoc);
+        return json(req);
+      }
+
+      // --- TX ---
+
+      if (request.method === 'POST' && path === '/v1/tx/sign-and-execute') {
+        const input = SignAndExecuteSchema.parse(await parseJson(request));
+        const result = buildSignedTransferMessage({
+          vaultAddress: input.vaultAddress,
+          walletId: toSafeNumber(input.walletId),
+          seqno: toSafeNumber(input.seqno),
+          validUntil: toSafeNumber(input.validUntil),
+          to: input.to,
+          amountNano: input.amountNano,
+          queryId: input.queryId,
+          payloadBoc: input.payloadBoc,
+          secretKey: resolveSecretKeyFromHex(input.privateKeyHex),
+        });
+
+        if (input.dryRun) return json({ ...result, broadcasted: false });
+        const providerResponse = await broadcastViaEnv(result.externalMessageBoc, env);
+        return json({ ...result, broadcasted: true, providerResponse });
+      }
+
+      if (request.method === 'POST' && path === '/v1/tx/execute-signed') {
+        const input = ExecuteSignedSchema.parse(await parseJson(request));
+        const externalMessageBoc = wrapSignedBodyIntoExternalMessage(input.vaultAddress, input.signedBodyBoc);
+
+        if (input.dryRun) return json({ externalMessageBoc, broadcasted: false });
+        const providerResponse = await broadcastViaEnv(externalMessageBoc, env);
+        return json({ externalMessageBoc, broadcasted: true, providerResponse });
+      }
+
+      if (request.method === 'POST' && path === '/v1/tx/raw-execute') {
+        const input = RawExecuteSchema.parse(await parseJson(request));
+
+        if (input.dryRun) return json({ externalMessageBoc: input.externalMessageBoc, broadcasted: false });
+        const providerResponse = await broadcastViaEnv(input.externalMessageBoc, env);
+        return json({ externalMessageBoc: input.externalMessageBoc, broadcasted: true, providerResponse });
+      }
+
+      // --- Open4dev ---
+
+      if (request.method === 'POST' && path === '/v1/open4dev/orders/create-ton') {
+        const input = CreateTonOrderSchema.parse(await parseJson(request));
+        const result = buildCreateTonOrderMessage({
+          vaultAddress: input.vaultAddress,
+          walletId: toSafeNumber(input.walletId),
+          seqno: toSafeNumber(input.seqno),
+          validUntil: toSafeNumber(input.validUntil),
+          dexVaultTonAddress: input.dexVaultTonAddress,
+          sendValueNano: input.sendValueNano,
+          orderAmountNano: input.orderAmountNano,
+          priceRateNano: input.priceRateNano,
+          slippage: toSafeNumber(input.slippage),
+          toJettonMinter: input.toJettonMinter,
+          providerFeeAddress: input.providerFeeAddress,
+          feeNum: toSafeNumber(input.feeNum),
+          feeDenom: toSafeNumber(input.feeDenom),
+          matcherFeeNum: toSafeNumber(input.matcherFeeNum),
+          matcherFeeDenom: toSafeNumber(input.matcherFeeDenom),
+          oppositeVaultAddress: input.oppositeVaultAddress,
+          createdAt: input.createdAt !== undefined ? toSafeNumber(input.createdAt) : undefined,
+          queryId: input.queryId,
+          secretKey: resolveSecretKeyFromHex(input.privateKeyHex),
+        });
+
+        if (input.dryRun) return json({ ...result, broadcasted: false });
+        const providerResponse = await broadcastViaEnv(result.externalMessageBoc, env);
+        return json({ ...result, broadcasted: true, providerResponse });
+      }
+
+      if (request.method === 'POST' && path === '/v1/open4dev/orders/create-jetton') {
+        const input = CreateJettonOrderSchema.parse(await parseJson(request));
+        const result = buildCreateJettonOrderMessage({
+          vaultAddress: input.vaultAddress,
+          walletId: toSafeNumber(input.walletId),
+          seqno: toSafeNumber(input.seqno),
+          validUntil: toSafeNumber(input.validUntil),
+          jettonWalletAddress: input.jettonWalletAddress,
+          attachedTonAmountNano: input.attachedTonAmountNano,
+          jettonAmountNano: input.jettonAmountNano,
+          dexVaultAddress: input.dexVaultAddress,
+          ownerAddress: input.ownerAddress,
+          forwardTonAmountNano: input.forwardTonAmountNano,
+          priceRateNano: input.priceRateNano,
+          slippage: toSafeNumber(input.slippage),
+          toJettonMinter: input.toJettonMinter,
+          providerFeeAddress: input.providerFeeAddress,
+          feeNum: toSafeNumber(input.feeNum),
+          feeDenom: toSafeNumber(input.feeDenom),
+          matcherFeeNum: toSafeNumber(input.matcherFeeNum),
+          matcherFeeDenom: toSafeNumber(input.matcherFeeDenom),
+          oppositeVaultAddress: input.oppositeVaultAddress,
+          customPayloadBoc: input.customPayloadBoc,
+          createdAt: input.createdAt !== undefined ? toSafeNumber(input.createdAt) : undefined,
+          queryId: input.queryId,
+          secretKey: resolveSecretKeyFromHex(input.privateKeyHex),
+        });
+
+        if (input.dryRun) return json({ ...result, broadcasted: false });
+        const providerResponse = await broadcastViaEnv(result.externalMessageBoc, env);
+        return json({ ...result, broadcasted: true, providerResponse });
+      }
+
+      return json({ error: 'Not found' }, 404);
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : 'Unknown error' }, 400);
+    }
+  },
+};
+
+export default handler;
