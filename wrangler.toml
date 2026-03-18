@@ -15,3 +15,6 @@ TON_API_KEY_HEADER = "X-API-Key"
 [[kv_namespaces]]
 binding = "PENDING_STORE"
 id = "106e5c801af7479096cf2252764feef5"
+
+[triggers]
+crons = ["*/1 * * * *"]

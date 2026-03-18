@@ -2,6 +2,7 @@ import {
   buildSignedTransferMessage,
   wrapSignedBodyIntoExternalMessage,
 } from './services/tonMessage';
+import { TcSession, bridgeSendTransaction, bridgePollResponses, BridgeResponse } from './bridge';
 import { SignAndExecuteSchema, ExecuteSignedSchema, RawExecuteSchema } from './schemas/tx';
 import { resolveSecretKeyFromHex } from './utils/keys';
 import { toSafeNumber } from './utils/numbers';
@@ -147,6 +148,68 @@ async function revokeAllSessions(kv: KVNamespace, address: string, exceptSid: st
 async function findSessionByLabel(kv: KVNamespace, address: string, label: string): Promise<Session | null> {
   const sessions = await listSessions(kv, address);
   return sessions.find(s => s.label === label) ?? null;
+}
+
+// --- TON Connect Session Storage ---
+
+async function saveTcSession(kv: KVNamespace, address: string, session: TcSession): Promise<void> {
+  await kv.put(`tc:${address}`, JSON.stringify(session));
+}
+
+async function loadTcSession(kv: KVNamespace, address: string): Promise<TcSession | null> {
+  const raw = await kv.get(`tc:${address}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function getTcLastEventId(kv: KVNamespace, address: string): Promise<string | undefined> {
+  return (await kv.get(`tclast:${address}`)) ?? undefined;
+}
+
+async function setTcLastEventId(kv: KVNamespace, address: string, id: string): Promise<void> {
+  await kv.put(`tclast:${address}`, id);
+}
+
+async function processBridgeResponses(kv: KVNamespace, address: string, env: Env): Promise<void> {
+  const tcSession = await loadTcSession(kv, address);
+  if (!tcSession) return;
+
+  const lastEventId = await getTcLastEventId(kv, address);
+  const { responses, lastEventId: newLastEventId } = await bridgePollResponses(tcSession, lastEventId);
+
+  if (newLastEventId && newLastEventId !== lastEventId) {
+    await setTcLastEventId(kv, address, newLastEventId);
+  }
+
+  for (const response of responses) {
+    const reqId = response.id;
+    const req = await kvGetByIdForWallet(kv, reqId, address);
+    if (!req || req.status !== 'pending') continue;
+
+    if (response.error) {
+      req.status = 'rejected';
+      await kvUpdate(kv, req);
+    } else if (response.result) {
+      // Broadcast signed BOC
+      try {
+        if (env.TON_BROADCAST_URL) {
+          const headers: Record<string, string> = { 'content-type': 'application/json' };
+          if (env.TON_API_KEY && env.TON_API_KEY_HEADER) {
+            headers[env.TON_API_KEY_HEADER] = env.TON_API_KEY;
+          }
+          await fetch(env.TON_BROADCAST_URL, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ boc: response.result }),
+          });
+        }
+      } catch (e) {
+        console.error('Broadcast failed:', e);
+      }
+      req.status = 'confirmed';
+      req.txHash = response.result;
+      await kvUpdate(kv, req);
+    }
+  }
 }
 
 // --- Pending Store (KV-backed) ---
@@ -440,6 +503,45 @@ const OPENAPI_SPEC = {
         },
       },
     },
+    '/v1/auth/connect': {
+      post: {
+        summary: 'Save TON Connect session',
+        description: 'Persist the TON Connect session so the server can push signing requests directly to the wallet.',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['secretKey', 'publicKey', 'walletPublicKey', 'bridgeUrl'],
+            properties: {
+              secretKey: { type: 'string' },
+              publicKey: { type: 'string' },
+              walletPublicKey: { type: 'string' },
+              bridgeUrl: { type: 'string' },
+            },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Session saved' },
+          '400': { description: 'Missing fields', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/auth/tx-log': {
+      get: {
+        summary: 'Transaction log',
+        description: 'Returns recent transactions for the authenticated wallet.',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Transaction log', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: { transactions: { type: 'array', items: { '$ref': '#/components/schemas/PendingRequest' } } },
+          } } } },
+        },
+      },
+    },
     '/v1/safe/tx/transfer': {
       post: {
         summary: 'Request a transfer',
@@ -646,6 +748,19 @@ const OPENAPI_SPEC = {
 };
 
 const handler: ExportedHandler<Env> = {
+  async scheduled(event, env, ctx) {
+    // Cron: check bridge for wallet responses for all connected wallets
+    const tcKeys = await env.PENDING_STORE.list({ prefix: 'tc:' });
+    for (const key of tcKeys.keys) {
+      const address = key.name.slice(3);
+      try {
+        await processBridgeResponses(env.PENDING_STORE, address, env);
+      } catch (e) {
+        console.error(`Cron: bridge check failed for ${address}:`, e);
+      }
+    }
+  },
+
   async fetch(request, env) {
     // CORS preflight
     if (request.method === 'OPTIONS') {
@@ -732,6 +847,46 @@ const handler: ExportedHandler<Env> = {
         return json({ revoked: count });
       }
 
+      if (request.method === 'POST' && path === '/v1/auth/connect') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const session: TcSession = {
+          secretKey: body.secretKey as string,
+          publicKey: body.publicKey as string,
+          walletPublicKey: body.walletPublicKey as string,
+          bridgeUrl: body.bridgeUrl as string,
+          walletAddress: user.address,
+        };
+
+        if (!session.secretKey || !session.publicKey || !session.walletPublicKey || !session.bridgeUrl) {
+          return json({ error: 'Missing TON Connect session fields' }, 400);
+        }
+
+        await saveTcSession(env.PENDING_STORE, user.address, session);
+        return json({ ok: true });
+      }
+
+      if (request.method === 'GET' && path === '/v1/auth/tx-log') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        // Check bridge for any new responses first
+        try { await processBridgeResponses(env.PENDING_STORE, user.address, env); } catch {}
+
+        const list = await env.PENDING_STORE.list({ prefix: `widx:${user.address}:` });
+        const transactions: PendingRequest[] = [];
+        for (const key of list.keys) {
+          const id = key.name.split(':').pop();
+          if (!id) continue;
+          const raw = await env.PENDING_STORE.get(`req:${id}`);
+          if (raw) transactions.push(JSON.parse(raw));
+        }
+        transactions.sort((a, b) => b.createdAt - a.createdAt);
+        return json({ transactions });
+      }
+
       // --- Safe TX ---
 
       if (request.method === 'POST' && path === '/v1/safe/tx/transfer') {
@@ -745,14 +900,27 @@ const handler: ExportedHandler<Env> = {
           return json({ error: 'Missing required fields: to, amountNano' }, 400);
         }
 
-        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, typeof body.payloadBoc === 'string' ? body.payloadBoc : undefined);
+        const payloadBoc = typeof body.payloadBoc === 'string' ? body.payloadBoc : undefined;
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payloadBoc);
+
+        // Auto-push to wallet via TON Connect bridge
+        try {
+          const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
+          if (tcSession) {
+            await bridgeSendTransaction(tcSession, req.id, to, amountNano, payloadBoc);
+          }
+        } catch (e) {
+          console.error('Bridge send failed:', e);
+        }
+
         return json(req);
       }
 
       if (request.method === 'GET' && path === '/v1/safe/tx/pending') {
         const user = await authenticate(request, env);
         if (!user) return json({ error: 'Unauthorized' }, 401);
-        // Return ALL pending requests for this wallet (across all sessions)
+        // Check bridge for updates before listing
+        try { await processBridgeResponses(env.PENDING_STORE, user.address, env); } catch {}
         return json({ requests: await kvGetPendingByWallet(env.PENDING_STORE, user.address) });
       }
 
@@ -766,9 +934,14 @@ const handler: ExportedHandler<Env> = {
         const action = safeTxMatch[2]; // /confirm, /reject, or undefined
 
         if (!action && request.method === 'GET') {
-          // Allow viewing any request belonging to the same wallet
           const req = await kvGetByIdForWallet(env.PENDING_STORE, id, user.address);
           if (!req) return json({ error: 'Not found' }, 404);
+          // Check bridge for updates if still pending
+          if (req.status === 'pending') {
+            try { await processBridgeResponses(env.PENDING_STORE, user.address, env); } catch {}
+            const updated = await kvGetByIdForWallet(env.PENDING_STORE, id, user.address);
+            if (updated) return json(updated);
+          }
           return json(req);
         }
 

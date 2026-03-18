@@ -1,8 +1,8 @@
 // TON Connect bridge client for server-side signing
 // Handles encryption, sending transaction requests, and polling for wallet responses
 
-import nacl from 'tweetnacl';
-import naclUtil from 'tweetnacl-util';
+import * as nacl from 'tweetnacl';
+import * as naclUtil from 'tweetnacl-util';
 
 // --- Types ---
 
