@@ -291,23 +291,357 @@ async function parseJson(request: Request): Promise<unknown> {
 
 const OPENAPI_SPEC = {
   openapi: '3.1.0',
-  info: { title: 'Agent Gateway API (Worker)', version: '0.2.0' },
+  info: {
+    title: 'Agent Gateway API',
+    description: 'A secure gateway that lets AI agents request TON blockchain transactions while wallet owners keep full signing control.',
+    version: '0.2.0',
+  },
+  tags: [
+    { name: 'Auth', description: 'Authentication — create tokens, manage sessions' },
+    { name: 'Safe Transfers', description: 'Request transfers that require wallet owner approval via TON Connect' },
+    { name: 'Blockchain Raw', description: 'Direct blockchain operations — sign, execute, and broadcast transactions' },
+    { name: 'Open4dev DEX', description: 'Create orders on the open4dev on-chain order book' },
+  ],
+  components: {
+    securitySchemes: {
+      bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+    },
+    schemas: {
+      Error: {
+        type: 'object',
+        properties: { error: { type: 'string' } },
+        required: ['error'],
+      },
+      PendingRequest: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          sessionId: { type: 'string' },
+          type: { type: 'string' },
+          to: { type: 'string' },
+          amountNano: { type: 'string' },
+          payloadBoc: { type: 'string' },
+          status: { type: 'string', enum: ['pending', 'confirmed', 'rejected', 'expired'] },
+          createdAt: { type: 'number' },
+          expiresAt: { type: 'number' },
+          txHash: { type: 'string' },
+        },
+      },
+      Session: {
+        type: 'object',
+        properties: {
+          sid: { type: 'string' },
+          address: { type: 'string' },
+          label: { type: 'string' },
+          createdAt: { type: 'number' },
+        },
+      },
+    },
+  },
   paths: {
-    '/health': { get: { summary: 'Health check' } },
-    '/v1/auth/token': { post: { summary: 'Get auth token' } },
-    '/v1/auth/me': { get: { summary: 'Verify token' } },
-    '/v1/tx/sign-and-execute': { post: { summary: 'Sign transfer and execute' } },
-    '/v1/tx/execute-signed': { post: { summary: 'Execute signed body' } },
-    '/v1/tx/raw-execute': { post: { summary: 'Execute raw external BOC' } },
-    '/v1/safe/tx/transfer': { post: { summary: 'Request a safe transfer' } },
-    '/v1/safe/tx/pending': { get: { summary: 'List pending requests' } },
-    '/v1/safe/tx/:id': { get: { summary: 'Get request by ID' } },
-    '/v1/safe/tx/:id/confirm': { post: { summary: 'Confirm pending request' } },
-    '/v1/safe/tx/:id/reject': { post: { summary: 'Reject pending request' } },
-    '/v1/open4dev/orders/create-ton': { post: { summary: 'Create TON order for open4dev order-book' } },
-    '/v1/open4dev/orders/create-jetton': { post: { summary: 'Create Jetton order for open4dev order-book' } },
-    '/v1/safe/open4dev/orders/create-ton': { post: { summary: 'Safe-mode: create TON order (pending approval)' } },
-    '/v1/safe/open4dev/orders/create-jetton': { post: { summary: 'Safe-mode: create Jetton order (pending approval)' } },
+    '/health': {
+      get: {
+        summary: 'Health check',
+        tags: ['Auth'],
+        responses: { '200': { description: 'OK' } },
+      },
+    },
+    '/v1/auth/token': {
+      post: {
+        summary: 'Create auth token',
+        description: 'Exchange a TON wallet address for a JWT token. Each token creates an isolated session.',
+        tags: ['Auth'],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['address'],
+            properties: {
+              address: { type: 'string', description: 'TON wallet address (raw or friendly)' },
+              label: { type: 'string', description: 'Label for this token (e.g. "my-agent")', default: 'default' },
+              reuse: { type: 'boolean', description: 'Reuse existing session with same label', default: false },
+            },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Token created', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: {
+              token: { type: 'string' },
+              address: { type: 'string' },
+              sessionId: { type: 'string' },
+              label: { type: 'string' },
+            },
+          } } } },
+          '400': { description: 'Invalid address', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/auth/me': {
+      get: {
+        summary: 'Verify token',
+        description: 'Returns the wallet address and session ID for the current bearer token.',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Token valid', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: { address: { type: 'string' }, sessionId: { type: 'string' } },
+          } } } },
+          '401': { description: 'Unauthorized', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/auth/sessions': {
+      get: {
+        summary: 'List sessions',
+        description: 'Returns all active sessions for the authenticated wallet address.',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Sessions list', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: { sessions: { type: 'array', items: { '$ref': '#/components/schemas/Session' } } },
+          } } } },
+        },
+      },
+    },
+    '/v1/auth/revoke': {
+      post: {
+        summary: 'Revoke a session',
+        description: 'Revoke a specific session by its ID. Cannot revoke your own session.',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['sessionId'],
+            properties: { sessionId: { type: 'string' } },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Session revoked' },
+          '400': { description: 'Invalid request', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/auth/revoke-all': {
+      post: {
+        summary: 'Revoke all other sessions',
+        description: 'Revoke all sessions for this wallet except the current one.',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Sessions revoked', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: { revoked: { type: 'number' } },
+          } } } },
+        },
+      },
+    },
+    '/v1/safe/tx/transfer': {
+      post: {
+        summary: 'Request a transfer',
+        description: 'Creates a pending TON transfer request. The wallet owner must approve it via TON Connect within 5 minutes.',
+        tags: ['Safe Transfers'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['to', 'amountNano'],
+            properties: {
+              to: { type: 'string', description: 'Destination TON address' },
+              amountNano: { type: 'string', description: 'Amount in nanoTON (1 TON = 1000000000)' },
+              payloadBoc: { type: 'string', description: 'Optional BOC payload for the transaction' },
+            },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Request created', content: { 'application/json': { schema: { '$ref': '#/components/schemas/PendingRequest' } } } },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/safe/tx/pending': {
+      get: {
+        summary: 'List pending requests',
+        description: 'Returns all pending transfer requests for the authenticated wallet.',
+        tags: ['Safe Transfers'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Pending requests', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: { requests: { type: 'array', items: { '$ref': '#/components/schemas/PendingRequest' } } },
+          } } } },
+        },
+      },
+    },
+    '/v1/safe/tx/{id}': {
+      get: {
+        summary: 'Get request by ID',
+        description: 'Returns a specific transfer request by its ID.',
+        tags: ['Safe Transfers'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          '200': { description: 'Request found', content: { 'application/json': { schema: { '$ref': '#/components/schemas/PendingRequest' } } } },
+          '404': { description: 'Not found', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/safe/tx/{id}/confirm': {
+      post: {
+        summary: 'Confirm a request',
+        description: 'Mark a pending request as confirmed after the wallet signs the transaction.',
+        tags: ['Safe Transfers'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+        requestBody: {
+          content: { 'application/json': { schema: {
+            type: 'object',
+            properties: { txHash: { type: 'string', description: 'Transaction BOC from wallet' } },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Request confirmed', content: { 'application/json': { schema: { '$ref': '#/components/schemas/PendingRequest' } } } },
+          '400': { description: 'Not pending', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+          '404': { description: 'Not found', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/safe/tx/{id}/reject': {
+      post: {
+        summary: 'Reject a request',
+        description: 'Reject a pending transfer request.',
+        tags: ['Safe Transfers'],
+        security: [{ bearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          '200': { description: 'Request rejected', content: { 'application/json': { schema: { '$ref': '#/components/schemas/PendingRequest' } } } },
+          '400': { description: 'Not pending', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+          '404': { description: 'Not found', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/tx/sign-and-execute': {
+      post: {
+        summary: 'Sign and execute transfer',
+        description: 'Build, sign, and broadcast a TON transfer in one call. Requires server-side secret key.',
+        tags: ['Blockchain Raw'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['to', 'amountNano', 'walletAddress', 'secretKeyHex'],
+            properties: {
+              to: { type: 'string' },
+              amountNano: { type: 'string' },
+              walletAddress: { type: 'string' },
+              secretKeyHex: { type: 'string' },
+              payloadBoc: { type: 'string' },
+            },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Transaction broadcast result' },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/tx/execute-signed': {
+      post: {
+        summary: 'Execute signed body',
+        description: 'Wrap a pre-signed message body into an external message and broadcast it.',
+        tags: ['Blockchain Raw'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['signedBodyBoc', 'walletAddress'],
+            properties: {
+              signedBodyBoc: { type: 'string' },
+              walletAddress: { type: 'string' },
+            },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Transaction broadcast result' },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/tx/raw-execute': {
+      post: {
+        summary: 'Execute raw BOC',
+        description: 'Broadcast a fully constructed external message BOC directly to the network.',
+        tags: ['Blockchain Raw'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object',
+            required: ['boc'],
+            properties: { boc: { type: 'string' } },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Transaction broadcast result' },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/open4dev/orders/create-ton': {
+      post: {
+        summary: 'Create TON order',
+        description: 'Create a TON-side order on the open4dev on-chain order book. Signs and broadcasts directly.',
+        tags: ['Open4dev DEX'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Order created and broadcast' },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/open4dev/orders/create-jetton': {
+      post: {
+        summary: 'Create Jetton order',
+        description: 'Create a Jetton-side order on the open4dev on-chain order book. Signs and broadcasts directly.',
+        tags: ['Open4dev DEX'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Order created and broadcast' },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/safe/open4dev/orders/create-ton': {
+      post: {
+        summary: 'Request TON order (safe mode)',
+        description: 'Create a pending TON order that requires wallet owner approval before execution.',
+        tags: ['Open4dev DEX'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Pending order created', content: { 'application/json': { schema: { '$ref': '#/components/schemas/PendingRequest' } } } },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
+    '/v1/safe/open4dev/orders/create-jetton': {
+      post: {
+        summary: 'Request Jetton order (safe mode)',
+        description: 'Create a pending Jetton order that requires wallet owner approval before execution.',
+        tags: ['Open4dev DEX'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Pending order created', content: { 'application/json': { schema: { '$ref': '#/components/schemas/PendingRequest' } } } },
+          '400': { description: 'Invalid input', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
   },
 };
 
