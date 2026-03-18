@@ -2,7 +2,6 @@ name = "agent-gateway-api-open4dev"
 main = "src/worker.ts"
 compatibility_date = "2026-03-12"
 compatibility_flags = ["nodejs_compat"]
-account_id = "67fed51af58855d4ea1ea0263f4da84d"
 workers_dev = true
 
 [[routes]]
