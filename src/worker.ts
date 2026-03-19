@@ -8,6 +8,7 @@ import { resolveSecretKeyFromHex } from './utils/keys';
 import { toSafeNumber } from './utils/numbers';
 import { CreateJettonOrderSchema, CreateTonOrderSchema, SafeCreateTonOrderSchema, SafeCreateJettonOrderSchema } from './schemas/open4dev';
 import { buildCreateJettonOrderMessage, buildCreateTonOrderMessage, buildTonOrderPayload, buildJettonOrderPayload } from './services/open4devOrderBook';
+import { createTonApiClient } from './tonapi';
 
 interface Env {
   TON_BROADCAST_URL?: string;
@@ -15,6 +16,8 @@ interface Env {
   TON_API_KEY_HEADER?: string;
   JWT_SECRET?: string;
   PENDING_STORE: KVNamespace;
+  TONAPI_BASE_URL?: string;
+  TONAPI_KEY?: string;
 }
 
 // --- CORS ---
@@ -407,6 +410,7 @@ const OPENAPI_SPEC = {
     { name: 'Safe Transfers', description: 'Request transfers that require wallet owner approval via TON Connect' },
     { name: 'Blockchain Raw', description: 'Direct blockchain operations — sign, execute, and broadcast transactions' },
     { name: 'Open4dev DEX', description: 'Create orders on the open4dev on-chain order book' },
+    { name: 'Wallet', description: 'Wallet data — balances, tokens, NFTs, DNS, prices' },
   ],
   components: {
     securitySchemes: {
@@ -832,6 +836,27 @@ const OPENAPI_SPEC = {
         },
       },
     },
+    '/v1/wallet/balance': {
+      get: { summary: 'Get wallet balance', description: 'Returns TON balance and account status.', tags: ['Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Wallet balance', content: { 'application/json': { schema: { type: 'object', properties: { address: { type: 'string' }, balance: { type: 'string' }, status: { type: 'string' } } } } } } } } },
+    '/v1/wallet/jettons': {
+      get: { summary: 'Get jetton balances', description: 'Returns all jetton (token) balances.', tags: ['Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Jetton balances' } } } },
+    '/v1/wallet/transactions': {
+      get: { summary: 'Get transaction history', description: 'Returns recent transactions.', tags: ['Wallet'], security: [{ bearerAuth: [] }],
+        parameters: [{ name: 'limit', in: 'query', schema: { type: 'number', default: 20 } }],
+        responses: { '200': { description: 'Transactions' } } } },
+    '/v1/wallet/nfts': {
+      get: { summary: 'Get NFTs', description: 'Returns NFTs owned by the wallet.', tags: ['Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'NFT list' } } } },
+    '/v1/dns/{domain}/resolve': {
+      get: { summary: 'Resolve .ton domain', description: 'Resolve a .ton domain to a wallet address.', tags: ['Wallet'],
+        parameters: [{ name: 'domain', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: { '200': { description: 'Resolved address' } } } },
+    '/v1/market/price': {
+      get: { summary: 'Get token prices', description: 'Get current prices for TON and jettons.', tags: ['Wallet'],
+        parameters: [{ name: 'tokens', in: 'query', schema: { type: 'string', default: 'TON' } }, { name: 'currencies', in: 'query', schema: { type: 'string', default: 'USD' } }],
+        responses: { '200': { description: 'Price rates' } } } },
   },
 };
 
@@ -1041,6 +1066,97 @@ const handler: ExportedHandler<Env> = {
 
         await completeAuthRequest(env.PENDING_STORE, authId, token, address, sid);
         return json({ ok: true, token, address, sessionId: sid });
+      }
+
+      // --- Wallet Read ---
+
+      if (request.method === 'GET' && path === '/v1/wallet/balance') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const data = await client.getAccount(user.address);
+          return json({ address: data.address, balance: String(data.balance), status: data.status });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
+      }
+
+      if (request.method === 'GET' && path === '/v1/wallet/jettons') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const data = await client.getJettonBalances(user.address);
+          const balances = (data.balances ?? []).map((b: any) => ({
+            balance: b.balance,
+            symbol: b.jetton?.symbol,
+            name: b.jetton?.name,
+            decimals: b.jetton?.decimals,
+            address: b.jetton?.address,
+          }));
+          return json({ balances });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
+      }
+
+      if (request.method === 'GET' && path === '/v1/wallet/transactions') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        const limit = Number(new URL(request.url).searchParams.get('limit') ?? '20');
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const data = await client.getTransactions(user.address, limit);
+          return json({ events: data.events ?? [] });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
+      }
+
+      if (request.method === 'GET' && path === '/v1/wallet/nfts') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const data = await client.getNftItems(user.address);
+          const items = (data.nft_items ?? []).map((n: any) => ({
+            address: n.address,
+            name: n.metadata?.name,
+            image: n.metadata?.image,
+            collection: n.collection?.name,
+          }));
+          return json({ nfts: items });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
+      }
+
+      // --- Public Read (no auth) ---
+
+      const dnsMatch = path.match(/^\/v1\/dns\/([^/]+)\/resolve$/);
+      if (dnsMatch && request.method === 'GET') {
+        const domain = decodeURIComponent(dnsMatch[1]);
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const data = await client.resolveDns(domain);
+          return json({ domain, address: data.wallet?.address ?? null, name: data.wallet?.name ?? null });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
+      }
+
+      if (request.method === 'GET' && path === '/v1/market/price') {
+        const params = new URL(request.url).searchParams;
+        const tokens = (params.get('tokens') ?? 'TON').split(',');
+        const currencies = (params.get('currencies') ?? 'USD').split(',');
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const data = await client.getRates(tokens, currencies);
+          return json({ rates: data.rates ?? {} });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
       }
 
       // --- Safe TX ---

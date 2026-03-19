@@ -11,6 +11,7 @@ custom_domain = true
 [vars]
 TON_BROADCAST_URL = "https://testnet.toncenter.com/api/v2/sendBoc"
 TON_API_KEY_HEADER = "X-API-Key"
+TONAPI_BASE_URL = "https://tonapi.io"
 
 [[kv_namespaces]]
 binding = "PENDING_STORE"
