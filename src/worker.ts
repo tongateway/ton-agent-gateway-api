@@ -169,6 +169,49 @@ async function setTcLastEventId(kv: KVNamespace, address: string, id: string): P
   await kv.put(`tclast:${address}`, id);
 }
 
+// --- Agent Auth Flow ---
+
+interface AuthRequest {
+  authId: string;
+  status: 'pending' | 'completed';
+  token?: string;
+  address?: string;
+  sessionId?: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+async function createAuthRequest(kv: KVNamespace): Promise<AuthRequest> {
+  const authId = crypto.randomUUID();
+  const now = Date.now();
+  const req: AuthRequest = {
+    authId,
+    status: 'pending',
+    createdAt: now,
+    expiresAt: now + 10 * 60 * 1000, // 10 minutes TTL
+  };
+  await kv.put(`auth:${authId}`, JSON.stringify(req), { expirationTtl: 600 });
+  return req;
+}
+
+async function getAuthRequest(kv: KVNamespace, authId: string): Promise<AuthRequest | null> {
+  const raw = await kv.get(`auth:${authId}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function completeAuthRequest(kv: KVNamespace, authId: string, token: string, address: string, sessionId: string): Promise<AuthRequest | null> {
+  const raw = await kv.get(`auth:${authId}`);
+  if (!raw) return null;
+  const req: AuthRequest = JSON.parse(raw);
+  if (req.status !== 'pending') return null;
+  req.status = 'completed';
+  req.token = token;
+  req.address = address;
+  req.sessionId = sessionId;
+  await kv.put(`auth:${authId}`, JSON.stringify(req), { expirationTtl: 3600 }); // keep for 1 hour after completion
+  return req;
+}
+
 async function processBridgeResponses(kv: KVNamespace, address: string, env: Env): Promise<void> {
   const tcSession = await loadTcSession(kv, address);
   if (!tcSession) return;
@@ -542,6 +585,51 @@ const OPENAPI_SPEC = {
         },
       },
     },
+    '/v1/auth/request': {
+      post: {
+        summary: 'Request authentication',
+        description: 'Creates a one-time authentication link. The user opens it, connects their wallet, and the agent gets a token.',
+        tags: ['Auth'],
+        requestBody: {
+          content: { 'application/json': { schema: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'Label for the token', default: 'agent' },
+            },
+          } } },
+        },
+        responses: {
+          '200': { description: 'Auth request created', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: {
+              authId: { type: 'string' },
+              authUrl: { type: 'string' },
+              expiresAt: { type: 'number' },
+            },
+          } } } },
+        },
+      },
+    },
+    '/v1/auth/check/{authId}': {
+      get: {
+        summary: 'Check auth status',
+        description: 'Poll for authentication completion. Returns token when the user has connected their wallet.',
+        tags: ['Auth'],
+        parameters: [{ name: 'authId', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          '200': { description: 'Auth status', content: { 'application/json': { schema: {
+            type: 'object',
+            properties: {
+              status: { type: 'string', enum: ['pending', 'completed'] },
+              authId: { type: 'string' },
+              token: { type: 'string' },
+              address: { type: 'string' },
+            },
+          } } } },
+          '404': { description: 'Not found', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } } },
+        },
+      },
+    },
     '/v1/safe/tx/transfer': {
       post: {
         summary: 'Request a transfer',
@@ -885,6 +973,74 @@ const handler: ExportedHandler<Env> = {
         }
         transactions.sort((a, b) => b.createdAt - a.createdAt);
         return json({ transactions });
+      }
+
+      // --- Agent Auth Flow ---
+
+      if (request.method === 'POST' && path === '/v1/auth/request') {
+        const body = await parseJson(request) as Record<string, unknown>;
+        const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : 'agent';
+        const authReq = await createAuthRequest(env.PENDING_STORE);
+        const baseUrl = new URL(request.url).origin.replace('api.', '');
+        return json({
+          authId: authReq.authId,
+          authUrl: `https://tongateway.ai/connect.html?authId=${authReq.authId}`,
+          expiresAt: authReq.expiresAt,
+          label,
+        });
+      }
+
+      const authCheckMatch = path.match(/^\/v1\/auth\/check\/([^/]+)$/);
+      if (authCheckMatch && request.method === 'GET') {
+        const authId = authCheckMatch[1];
+        const authReq = await getAuthRequest(env.PENDING_STORE, authId);
+        if (!authReq) return json({ error: 'Auth request not found or expired' }, 404);
+        if (authReq.status === 'pending') {
+          return json({ status: 'pending', authId, expiresAt: authReq.expiresAt });
+        }
+        return json({
+          status: 'completed',
+          authId,
+          token: authReq.token,
+          address: authReq.address,
+          sessionId: authReq.sessionId,
+        });
+      }
+
+      const authCompleteMatch = path.match(/^\/v1\/auth\/complete\/([^/]+)$/);
+      if (authCompleteMatch && request.method === 'POST') {
+        const authId = authCompleteMatch[1];
+        const authReq = await getAuthRequest(env.PENDING_STORE, authId);
+        if (!authReq) return json({ error: 'Auth request not found or expired' }, 404);
+        if (authReq.status !== 'pending') return json({ error: 'Auth request already completed' }, 400);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const address = body.address as string;
+        const label = typeof body.label === 'string' ? body.label : 'agent';
+        if (!address || typeof address !== 'string' || address.length < 10) {
+          return json({ error: 'Invalid address' }, 400);
+        }
+
+        const secret = env.JWT_SECRET ?? 'change-me-in-production';
+        const sid = crypto.randomUUID();
+        const token = await jwtSign({ address, sid }, secret);
+        await createSession(env.PENDING_STORE, sid, address, label);
+
+        // Save TC session if provided
+        const tcData = body.tcSession as Record<string, unknown> | undefined;
+        if (tcData && tcData.secretKey && tcData.publicKey && tcData.walletPublicKey && tcData.bridgeUrl) {
+          const tcSession: TcSession = {
+            secretKey: tcData.secretKey as string,
+            publicKey: tcData.publicKey as string,
+            walletPublicKey: tcData.walletPublicKey as string,
+            bridgeUrl: tcData.bridgeUrl as string,
+            walletAddress: address,
+          };
+          await saveTcSession(env.PENDING_STORE, address, tcSession);
+        }
+
+        await completeAuthRequest(env.PENDING_STORE, authId, token, address, sid);
+        return json({ ok: true, token, address, sessionId: sid });
       }
 
       // --- Safe TX ---
