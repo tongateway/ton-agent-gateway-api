@@ -78,6 +78,7 @@ export async function bridgeSendTransaction(
   to: string,
   amountNano: string,
   payloadBoc?: string,
+  stateInit?: string,
 ): Promise<void> {
   const transaction = {
     valid_until: Math.floor(Date.now() / 1000) + 300,
@@ -85,6 +86,7 @@ export async function bridgeSendTransaction(
       address: to,
       amount: amountNano,
       ...(payloadBoc ? { payload: payloadBoc } : {}),
+      ...(stateInit ? { stateInit } : {}),
     }],
   };
 

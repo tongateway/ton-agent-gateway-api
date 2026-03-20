@@ -235,6 +235,8 @@ async function processBridgeResponses(kv: KVNamespace, address: string, env: Env
       req.status = 'rejected';
       await kvUpdate(kv, req);
     } else if (response.result) {
+      req.status = 'confirmed';
+      req.txHash = response.result;
       // Broadcast signed BOC
       try {
         if (env.TON_BROADCAST_URL) {
@@ -242,17 +244,24 @@ async function processBridgeResponses(kv: KVNamespace, address: string, env: Env
           if (env.TON_API_KEY && env.TON_API_KEY_HEADER) {
             headers[env.TON_API_KEY_HEADER] = env.TON_API_KEY;
           }
-          await fetch(env.TON_BROADCAST_URL, {
+          const broadcastRes = await fetch(env.TON_BROADCAST_URL, {
             method: 'POST',
             headers,
             body: JSON.stringify({ boc: response.result }),
           });
+          if (broadcastRes.ok) {
+            req.broadcastResult = 'success';
+          } else {
+            const errBody = await broadcastRes.text();
+            req.broadcastResult = 'failed';
+            req.broadcastError = `${broadcastRes.status}: ${errBody.slice(0, 200)}`;
+          }
         }
-      } catch (e) {
+      } catch (e: any) {
+        req.broadcastResult = 'failed';
+        req.broadcastError = e.message;
         console.error('Broadcast failed:', e);
       }
-      req.status = 'confirmed';
-      req.txHash = response.result;
       await kvUpdate(kv, req);
     }
   }
@@ -268,15 +277,18 @@ interface PendingRequest {
   to: string;
   amountNano: string;
   payloadBoc?: string;
+  stateInit?: string;
   status: 'pending' | 'confirmed' | 'rejected' | 'expired';
   createdAt: number;
   expiresAt: number;
   txHash?: string;
+  broadcastResult?: 'success' | 'failed';
+  broadcastError?: string;
 }
 
 const TTL_SEC = 5 * 60; // 5 minutes
 
-async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress: string, to: string, amountNano: string, payloadBoc?: string): Promise<PendingRequest> {
+async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress: string, to: string, amountNano: string, payloadBoc?: string, stateInit?: string): Promise<PendingRequest> {
   const now = Date.now();
   const req: PendingRequest = {
     id: crypto.randomUUID(),
@@ -285,7 +297,7 @@ async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress
     type: 'transfer',
     to,
     amountNano,
-    payloadBoc,
+    payloadBoc, stateInit,
     status: 'pending',
     createdAt: now,
     expiresAt: now + TTL_SEC * 1000,
@@ -435,6 +447,8 @@ const OPENAPI_SPEC = {
           createdAt: { type: 'number' },
           expiresAt: { type: 'number' },
           txHash: { type: 'string' },
+          broadcastResult: { type: 'string', enum: ['success', 'failed'] },
+          broadcastError: { type: 'string' },
         },
       },
       Session: {
@@ -649,6 +663,7 @@ const OPENAPI_SPEC = {
               to: { type: 'string', description: 'Destination TON address' },
               amountNano: { type: 'string', description: 'Amount in nanoTON (1 TON = 1000000000)' },
               payloadBoc: { type: 'string', description: 'Optional BOC payload for the transaction' },
+              stateInit: { type: 'string', description: 'Optional stateInit BOC for contract deployment' },
             },
           } } },
         },
@@ -1173,13 +1188,14 @@ const handler: ExportedHandler<Env> = {
         }
 
         const payloadBoc = typeof body.payloadBoc === 'string' ? body.payloadBoc : undefined;
-        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payloadBoc);
+        const stateInit = typeof body.stateInit === 'string' ? body.stateInit : undefined;
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payloadBoc, stateInit);
 
         // Auto-push to wallet via TON Connect bridge
         try {
           const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
           if (tcSession) {
-            await bridgeSendTransaction(tcSession, req.id, to, amountNano, payloadBoc);
+            await bridgeSendTransaction(tcSession, req.id, to, amountNano, payloadBoc, stateInit);
           }
         } catch (e) {
           console.error('Bridge send failed:', e);
