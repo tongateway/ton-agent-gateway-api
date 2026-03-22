@@ -1,33 +1,28 @@
-# Agent API Monorepo (TON)
+# Agent Gateway — API
 
-Two separate folders are created:
+Cloudflare Worker API for [Agent Gateway](https://tongateway.ai). Handles authentication, safe transfers, wallet reads, agent wallets, and TON Connect bridge.
 
-- `contract/` - TON FunC smart contract (`AgentVault`) with owner/admin/session-key policy
-- `api/` - Fastify Swagger API for signing/building/broadcasting vault transactions
+**Live at [api.tongateway.ai](https://api.tongateway.ai/docs)**
 
-## Quick start
+## Endpoints
 
-### Contract
+| Group | Endpoints |
+|-------|-----------|
+| **Auth** | `/v1/auth/token`, `/v1/auth/me`, `/v1/auth/request`, `/v1/auth/check/:id`, `/v1/auth/connect` |
+| **Safe Transfers** | `/v1/safe/tx/transfer`, `/v1/safe/tx/pending`, `/v1/safe/tx/:id`, confirm, reject |
+| **Wallet** | `/v1/wallet/balance`, `/v1/wallet/jettons`, `/v1/wallet/transactions`, `/v1/wallet/nfts` |
+| **Lookup** | `/v1/dns/:domain/resolve`, `/v1/market/price` |
+| **Agent Wallet** | `/v1/agent-wallet/deploy`, `/v1/agent-wallet/execute`, `/v1/agent-wallet/info`, `/v1/agent-wallet/list` |
 
-```bash
-cd contract
-npm install
-npm run build
-npm test
-```
+## Deploy
 
-### API
+Auto-deploys on push to `main` via GitHub Actions + Cloudflare Workers.
 
-```bash
-cd api
-cp .env.example .env
-npm install
-npm run dev
-```
+## Related
 
-Swagger will be available at `http://localhost:8080/docs`.
-
-The API includes generic transaction routes plus open4dev order-book helpers:
-
-- `POST /v1/open4dev/orders/create-ton`
-- `POST /v1/open4dev/orders/create-jetton`
+| Repository | Description |
+|---|---|
+| [@tongateway/mcp](https://github.com/tongateway/mcp) | MCP server (14 tools) |
+| [ton-agent-gateway-client](https://github.com/tongateway/ton-agent-gateway-client) | Landing page + dashboard |
+| [ton-agent-gateway-contract](https://github.com/tongateway/ton-agent-gateway-contract) | Agent Wallet smart contract |
+| [ton-agent-gateway](https://github.com/tongateway/ton-agent-gateway) | Main repo with overview |
