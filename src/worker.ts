@@ -172,6 +172,41 @@ async function setTcLastEventId(kv: KVNamespace, address: string, id: string): P
   await kv.put(`tclast:${address}`, id);
 }
 
+// --- Agent Wallet Storage ---
+
+interface AgentWalletConfig {
+  address: string;          // vault contract address
+  adminAddress: string;     // owner wallet address
+  ownerPublicKey: string;   // hex
+  agentSecretKey: string;   // hex (64 bytes ed25519 secret key)
+  agentPublicKey: string;   // hex (32 bytes)
+  walletId: number;
+  createdAt: number;
+}
+
+async function saveAgentWallet(kv: KVNamespace, config: AgentWalletConfig): Promise<void> {
+  await kv.put(`aw:${config.address}`, JSON.stringify(config));
+  // Index by admin address for listing
+  await kv.put(`awidx:${config.adminAddress}:${config.address}`, config.address);
+}
+
+async function loadAgentWallet(kv: KVNamespace, address: string): Promise<AgentWalletConfig | null> {
+  const raw = await kv.get(`aw:${address}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function listAgentWallets(kv: KVNamespace, adminAddress: string): Promise<AgentWalletConfig[]> {
+  const list = await kv.list({ prefix: `awidx:${adminAddress}:` });
+  const wallets: AgentWalletConfig[] = [];
+  for (const key of list.keys) {
+    const addr = key.name.split(':').pop();
+    if (!addr) continue;
+    const raw = await kv.get(`aw:${addr}`);
+    if (raw) wallets.push(JSON.parse(raw));
+  }
+  return wallets;
+}
+
 // --- Agent Auth Flow ---
 
 interface AuthRequest {
@@ -423,6 +458,7 @@ const OPENAPI_SPEC = {
     { name: 'Blockchain Raw', description: 'Direct blockchain operations — sign, execute, and broadcast transactions' },
     { name: 'Open4dev DEX', description: 'Create orders on the open4dev on-chain order book' },
     { name: 'Wallet', description: 'Wallet data — balances, tokens, NFTs, DNS, prices' },
+    { name: 'Agent Wallet', description: 'Deploy and manage autonomous agent wallets (no approval needed for transfers)' },
   ],
   components: {
     securitySchemes: {
@@ -872,6 +908,29 @@ const OPENAPI_SPEC = {
       get: { summary: 'Get token prices', description: 'Get current prices for TON and jettons.', tags: ['Wallet'],
         parameters: [{ name: 'tokens', in: 'query', schema: { type: 'string', default: 'TON' } }, { name: 'currencies', in: 'query', schema: { type: 'string', default: 'USD' } }],
         responses: { '200': { description: 'Price rates' } } } },
+    '/v1/agent-wallet/deploy': {
+      post: { summary: 'Generate agent wallet keypair', description: 'Generate an agent keypair for a new agent wallet deployment.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['ownerPublicKey'], properties: { ownerPublicKey: { type: 'string' } } } } } },
+        responses: { '200': { description: 'Keypair generated' } } } },
+    '/v1/agent-wallet/register': {
+      post: { summary: 'Register deployed agent wallet', description: 'Store agent wallet config after deployment.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Registered' } } } },
+    '/v1/agent-wallet/execute': {
+      post: { summary: 'Execute transfer from agent wallet', description: 'Sign and broadcast transfer from agent wallet. No approval needed.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Transfer executed' }, '501': { description: 'Use MCP tool instead' } } } },
+    '/v1/agent-wallet/set-agent': {
+      post: { summary: 'Set agent key', description: 'Send adminSetAgent to the vault. Requires wallet approval.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Request created' } } } },
+    '/v1/agent-wallet/revoke-agent': {
+      post: { summary: 'Revoke agent key', description: 'Send adminRevokeAgent to the vault. Requires wallet approval.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Request created' } } } },
+    '/v1/agent-wallet/list': {
+      get: { summary: 'List agent wallets', description: 'List all agent wallets for the authenticated wallet.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        responses: { '200': { description: 'Wallet list' } } } },
+    '/v1/agent-wallet/{address}/info': {
+      get: { summary: 'Get agent wallet info', description: 'Get balance, seqno, and agent key status.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
+        parameters: [{ name: 'address', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: { '200': { description: 'Wallet info' } } } },
   },
 };
 
@@ -1169,6 +1228,252 @@ const handler: ExportedHandler<Env> = {
         try {
           const data = await client.getRates(tokens, currencies);
           return json({ rates: data.rates ?? {} });
+        } catch (e: any) {
+          return json({ error: e.message }, 502);
+        }
+      }
+
+      // --- Agent Wallet ---
+
+      if (request.method === 'POST' && path === '/v1/agent-wallet/deploy') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const ownerPublicKey = body.ownerPublicKey as string;
+        if (!ownerPublicKey || typeof ownerPublicKey !== 'string' || ownerPublicKey.length !== 64) {
+          return json({ error: 'ownerPublicKey must be 64-char hex (32 bytes ed25519 public key)' }, 400);
+        }
+
+        // Generate agent keypair
+        const agentSeed = new Uint8Array(32);
+        crypto.getRandomValues(agentSeed);
+
+        // We need to use tweetnacl for ed25519 sign keypair from seed
+        const nacl = await import('tweetnacl');
+        const agentKp = nacl.default.sign.keyPair.fromSeed(agentSeed);
+        const agentPublicKey = Array.from(agentKp.publicKey).map(b => b.toString(16).padStart(2, '0')).join('');
+        const agentSecretKey = Array.from(agentKp.secretKey).map(b => b.toString(16).padStart(2, '0')).join('');
+
+        const walletId = Math.floor(Date.now() / 1000);
+
+        // Return deploy info — the client/MCP will build the stateInit
+        // We store the config so execute can use the agent key later
+        const config: AgentWalletConfig = {
+          address: '', // will be set after deploy
+          adminAddress: user.address,
+          ownerPublicKey,
+          agentSecretKey,
+          agentPublicKey,
+          walletId,
+          createdAt: Date.now(),
+        };
+
+        return json({
+          ownerPublicKey,
+          agentPublicKey,
+          agentSecretKey, // returned once for the deployer to know
+          walletId,
+          adminAddress: user.address,
+        });
+      }
+
+      if (request.method === 'POST' && path === '/v1/agent-wallet/register') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const address = body.address as string;
+        const agentSecretKey = body.agentSecretKey as string;
+        const agentPublicKey = body.agentPublicKey as string;
+        const ownerPublicKey = body.ownerPublicKey as string;
+        const walletId = body.walletId as number;
+
+        if (!address || !agentSecretKey || !agentPublicKey || !ownerPublicKey || !walletId) {
+          return json({ error: 'Missing required fields' }, 400);
+        }
+
+        const config: AgentWalletConfig = {
+          address,
+          adminAddress: user.address,
+          ownerPublicKey,
+          agentSecretKey,
+          agentPublicKey,
+          walletId,
+          createdAt: Date.now(),
+        };
+
+        await saveAgentWallet(env.PENDING_STORE, config);
+        return json({ ok: true, address });
+      }
+
+      if (request.method === 'POST' && path === '/v1/agent-wallet/execute') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const walletAddress = body.walletAddress as string;
+        const to = body.to as string;
+        const amountNano = body.amountNano as string;
+
+        if (!walletAddress || !to || !amountNano) {
+          return json({ error: 'Missing required fields: walletAddress, to, amountNano' }, 400);
+        }
+
+        const config = await loadAgentWallet(env.PENDING_STORE, walletAddress);
+        if (!config) return json({ error: 'Agent wallet not found' }, 404);
+        if (config.adminAddress !== user.address) return json({ error: 'Not your agent wallet' }, 403);
+
+        // Get seqno from chain
+        const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        let seqno: number;
+        try {
+          const methods = await fetch(`${env.TONAPI_BASE_URL ?? 'https://tonapi.io'}/v2/blockchain/accounts/${encodeURIComponent(walletAddress)}/methods/seqno`, {
+            headers: env.TONAPI_KEY ? { Authorization: `Bearer ${env.TONAPI_KEY}` } : {},
+          });
+          const methodResult = await methods.json() as any;
+          seqno = parseInt(methodResult.stack?.[0]?.num ?? '0', 16);
+        } catch {
+          return json({ error: 'Failed to get seqno from chain' }, 502);
+        }
+
+        // Build and sign external message
+        // We need to replicate AgentVault.buildSignedBody logic here
+        // Import nacl for signing
+        const nacl2 = await import('tweetnacl');
+        const secretKey = new Uint8Array(Buffer.from(config.agentSecretKey, 'hex'));
+
+        const validUntil = Math.floor(Date.now() / 1000) + 300;
+
+        // Build unsigned body: prefix(32) + walletId(32) + validUntil(32) + seqno(32) + maybeRef(actions)
+        // Build transfer message: 0x18(6) + address + coins + 0(1+4+4+64+32+1+1)
+        // This is complex TVM cell building - we need @ton/core
+        // For now, return the params and let the MCP build it
+        return json({
+          error: 'Execute requires @ton/core for cell building. Use MCP tool execute_agent_wallet_transfer instead.',
+          hint: 'The MCP tool has @ton/core available and can build+sign+broadcast the external message.',
+          seqno,
+          walletId: config.walletId,
+          agentPublicKey: config.agentPublicKey,
+        }, 501);
+      }
+
+      if (request.method === 'POST' && path === '/v1/agent-wallet/set-agent') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const walletAddress = body.walletAddress as string;
+        const validUntil = body.validUntil as number;
+
+        if (!walletAddress) return json({ error: 'Missing walletAddress' }, 400);
+
+        const config = await loadAgentWallet(env.PENDING_STORE, walletAddress);
+        if (!config) return json({ error: 'Agent wallet not found' }, 404);
+        if (config.adminAddress !== user.address) return json({ error: 'Not your agent wallet' }, 403);
+
+        const agentPubKeyBuf = Buffer.from(config.agentPublicKey, 'hex');
+        const expiry = validUntil ?? Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
+
+        // Build adminSetAgent payload: op(32) + queryId(64) + agentPubKey(256) + validUntil(32)
+        // op::admin_set_agent = 0x61677374
+        const payloadHex = '61677374' + '0000000000000000' +
+          config.agentPublicKey +
+          expiry.toString(16).padStart(8, '0');
+
+        // Create safe transfer request to send this as internal message to the vault
+        const payload = Buffer.from(payloadHex, 'hex').toString('base64');
+
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, walletAddress, '50000000', payload);
+
+        // Auto-push to wallet via TON Connect bridge
+        try {
+          const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
+          if (tcSession) {
+            await bridgeSendTransaction(tcSession, req.id, walletAddress, '50000000', payload);
+          }
+        } catch {}
+
+        return json({ ...req, agentPublicKey: config.agentPublicKey, validUntil: expiry });
+      }
+
+      if (request.method === 'POST' && path === '/v1/agent-wallet/revoke-agent') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const walletAddress = body.walletAddress as string;
+
+        if (!walletAddress) return json({ error: 'Missing walletAddress' }, 400);
+
+        const config = await loadAgentWallet(env.PENDING_STORE, walletAddress);
+        if (!config) return json({ error: 'Agent wallet not found' }, 404);
+        if (config.adminAddress !== user.address) return json({ error: 'Not your agent wallet' }, 403);
+
+        // Build adminRevokeAgent payload: op(32) + queryId(64)
+        // op::admin_revoke_agent = 0x6172766B
+        const payloadHex = '6172766b' + '0000000000000000';
+        const payload = Buffer.from(payloadHex, 'hex').toString('base64');
+
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, walletAddress, '50000000', payload);
+
+        try {
+          const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
+          if (tcSession) {
+            await bridgeSendTransaction(tcSession, req.id, walletAddress, '50000000', payload);
+          }
+        } catch {}
+
+        return json(req);
+      }
+
+      if (request.method === 'GET' && path === '/v1/agent-wallet/list') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const wallets = await listAgentWallets(env.PENDING_STORE, user.address);
+        // Don't expose secret keys in list
+        const safe = wallets.map(w => ({
+          address: w.address,
+          agentPublicKey: w.agentPublicKey,
+          walletId: w.walletId,
+          createdAt: w.createdAt,
+        }));
+        return json({ wallets: safe });
+      }
+
+      const awInfoMatch = path.match(/^\/v1\/agent-wallet\/([^/]+)\/info$/);
+      if (awInfoMatch && request.method === 'GET') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const walletAddress = decodeURIComponent(awInfoMatch[1]);
+        const config = await loadAgentWallet(env.PENDING_STORE, walletAddress);
+        if (!config) return json({ error: 'Agent wallet not found' }, 404);
+        if (config.adminAddress !== user.address) return json({ error: 'Not your agent wallet' }, 403);
+
+        // Get balance and seqno from chain
+        const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        try {
+          const account = await tonapiClient.getAccount(walletAddress);
+          let seqno = 0;
+          try {
+            const methods = await fetch(`${env.TONAPI_BASE_URL ?? 'https://tonapi.io'}/v2/blockchain/accounts/${encodeURIComponent(walletAddress)}/methods/seqno`, {
+              headers: env.TONAPI_KEY ? { Authorization: `Bearer ${env.TONAPI_KEY}` } : {},
+            });
+            const methodResult = await methods.json() as any;
+            seqno = parseInt(methodResult.stack?.[0]?.num ?? '0', 16);
+          } catch {}
+
+          return json({
+            address: walletAddress,
+            balance: String(account.balance),
+            status: account.status,
+            seqno,
+            agentPublicKey: config.agentPublicKey,
+            walletId: config.walletId,
+            createdAt: config.createdAt,
+          });
         } catch (e: any) {
           return json({ error: e.message }, 502);
         }
