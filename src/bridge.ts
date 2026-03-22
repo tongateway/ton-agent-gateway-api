@@ -77,7 +77,7 @@ export async function bridgeSendTransaction(
   requestId: string,
   to: string,
   amountNano: string,
-  payloadBoc?: string,
+  payload?: string,
   stateInit?: string,
 ): Promise<void> {
   const transaction = {
@@ -85,7 +85,7 @@ export async function bridgeSendTransaction(
     messages: [{
       address: to,
       amount: amountNano,
-      ...(payloadBoc ? { payload: payloadBoc } : {}),
+      ...(payload ? { payload: payload } : {}),
       ...(stateInit ? { stateInit } : {}),
     }],
   };

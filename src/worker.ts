@@ -276,7 +276,7 @@ interface PendingRequest {
   type: 'transfer';
   to: string;
   amountNano: string;
-  payloadBoc?: string;
+  payload?: string;
   stateInit?: string;
   status: 'pending' | 'confirmed' | 'rejected' | 'expired';
   createdAt: number;
@@ -288,7 +288,7 @@ interface PendingRequest {
 
 const TTL_SEC = 5 * 60; // 5 minutes
 
-async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress: string, to: string, amountNano: string, payloadBoc?: string, stateInit?: string): Promise<PendingRequest> {
+async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress: string, to: string, amountNano: string, payload?: string, stateInit?: string): Promise<PendingRequest> {
   const now = Date.now();
   const req: PendingRequest = {
     id: crypto.randomUUID(),
@@ -297,7 +297,7 @@ async function kvCreatePending(kv: KVNamespace, sessionId: string, walletAddress
     type: 'transfer',
     to,
     amountNano,
-    payloadBoc, stateInit,
+    payload, stateInit,
     status: 'pending',
     createdAt: now,
     expiresAt: now + TTL_SEC * 1000,
@@ -442,7 +442,7 @@ const OPENAPI_SPEC = {
           type: { type: 'string' },
           to: { type: 'string' },
           amountNano: { type: 'string' },
-          payloadBoc: { type: 'string' },
+          payload: { type: 'string' },
           status: { type: 'string', enum: ['pending', 'confirmed', 'rejected', 'expired'] },
           createdAt: { type: 'number' },
           expiresAt: { type: 'number' },
@@ -662,7 +662,7 @@ const OPENAPI_SPEC = {
             properties: {
               to: { type: 'string', description: 'Destination TON address' },
               amountNano: { type: 'string', description: 'Amount in nanoTON (1 TON = 1000000000)' },
-              payloadBoc: { type: 'string', description: 'Optional BOC payload for the transaction' },
+              payload: { type: 'string', description: 'Optional BOC payload for the transaction' },
               stateInit: { type: 'string', description: 'Optional stateInit BOC for contract deployment' },
             },
           } } },
@@ -750,7 +750,7 @@ const OPENAPI_SPEC = {
               amountNano: { type: 'string' },
               walletAddress: { type: 'string' },
               secretKeyHex: { type: 'string' },
-              payloadBoc: { type: 'string' },
+              payload: { type: 'string' },
             },
           } } },
         },
@@ -1187,15 +1187,15 @@ const handler: ExportedHandler<Env> = {
           return json({ error: 'Missing required fields: to, amountNano' }, 400);
         }
 
-        const payloadBoc = typeof body.payloadBoc === 'string' ? body.payloadBoc : undefined;
+        const payload = typeof body.payload === 'string' ? body.payload : undefined;
         const stateInit = typeof body.stateInit === 'string' ? body.stateInit : undefined;
-        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payloadBoc, stateInit);
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payload, stateInit);
 
         // Auto-push to wallet via TON Connect bridge
         try {
           const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
           if (tcSession) {
-            await bridgeSendTransaction(tcSession, req.id, to, amountNano, payloadBoc, stateInit);
+            await bridgeSendTransaction(tcSession, req.id, to, amountNano, payload, stateInit);
           }
         } catch (e) {
           console.error('Bridge send failed:', e);
@@ -1283,7 +1283,7 @@ const handler: ExportedHandler<Env> = {
           createdAt: input.createdAt !== undefined ? toSafeNumber(input.createdAt) : undefined,
         });
 
-        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, order.to, order.amountNano, order.payloadBoc);
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, order.to, order.amountNano, order.payload);
         return json(req);
       }
 
@@ -1313,7 +1313,7 @@ const handler: ExportedHandler<Env> = {
           queryId: input.queryId,
         });
 
-        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, order.to, order.amountNano, order.payloadBoc);
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, order.to, order.amountNano, order.payload);
         return json(req);
       }
 
@@ -1329,7 +1329,7 @@ const handler: ExportedHandler<Env> = {
           to: input.to,
           amountNano: input.amountNano,
           queryId: input.queryId,
-          payloadBoc: input.payloadBoc,
+          payload: input.payload,
           secretKey: resolveSecretKeyFromHex(input.privateKeyHex),
         });
 
