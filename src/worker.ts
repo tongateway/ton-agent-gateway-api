@@ -207,6 +207,41 @@ async function listAgentWallets(kv: KVNamespace, adminAddress: string): Promise<
   return wallets;
 }
 
+// --- DEX Pool Config ---
+
+interface DexPoolConfig {
+  pair: string;            // e.g. "NOT/TON"
+  direction: 'ton' | 'jetton'; // which side we're selling
+  dexVaultAddress: string;
+  oppositeVaultAddress: string;
+  jettonMinter: string;    // the jetton's minter address
+  providerFeeAddress: string;
+  feeNum: number;
+  feeDenom: number;
+  matcherFeeNum: number;
+  matcherFeeDenom: number;
+  slippage: number;        // default slippage
+}
+
+async function saveDexPool(kv: KVNamespace, pair: string, config: DexPoolConfig): Promise<void> {
+  await kv.put(`dex:${pair.toUpperCase()}`, JSON.stringify(config));
+}
+
+async function loadDexPool(kv: KVNamespace, pair: string): Promise<DexPoolConfig | null> {
+  const raw = await kv.get(`dex:${pair.toUpperCase()}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function listDexPools(kv: KVNamespace): Promise<DexPoolConfig[]> {
+  const list = await kv.list({ prefix: 'dex:' });
+  const pools: DexPoolConfig[] = [];
+  for (const key of list.keys) {
+    const raw = await kv.get(key.name);
+    if (raw) pools.push(JSON.parse(raw));
+  }
+  return pools;
+}
+
 // --- Agent Auth Flow ---
 
 interface AuthRequest {
@@ -459,6 +494,7 @@ const OPENAPI_SPEC = {
     { name: 'Open4dev DEX', description: 'Create orders on the open4dev on-chain order book' },
     { name: 'Wallet', description: 'Wallet data — balances, tokens, NFTs, DNS, prices' },
     { name: 'Agent Wallet', description: 'Deploy and manage autonomous agent wallets (no approval needed for transfers)' },
+    { name: 'DEX', description: 'Swap tokens via open4dev order book' },
   ],
   components: {
     securitySchemes: {
@@ -931,6 +967,19 @@ const OPENAPI_SPEC = {
       get: { summary: 'Get agent wallet info', description: 'Get balance, seqno, and agent key status.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
         parameters: [{ name: 'address', in: 'path', required: true, schema: { type: 'string' } }],
         responses: { '200': { description: 'Wallet info' } } } },
+    '/v1/dex/swap': {
+      post: { summary: 'Create swap order', description: 'Swap tokens via open4dev DEX. Agent provides token pair, amount, and price.', tags: ['DEX'], security: [{ bearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['fromToken', 'toToken', 'amount', 'priceRateNano'],
+          properties: {
+            fromToken: { type: 'string', description: 'Token to sell (e.g. "NOT", "TON")' },
+            toToken: { type: 'string', description: 'Token to buy (e.g. "TON", "NOT")' },
+            amount: { type: 'string', description: 'Amount in smallest unit (nanoTON or jetton decimals)' },
+            priceRateNano: { type: 'string', description: 'Price rate in nanoTON' },
+          } } } } },
+        responses: { '200': { description: 'Swap order created' }, '404': { description: 'Pool not found' } } } },
+    '/v1/dex/pools': {
+      get: { summary: 'List available pools', description: 'List all configured DEX trading pairs.', tags: ['DEX'],
+        responses: { '200': { description: 'Pool list' } } } },
   },
 };
 
@@ -1477,6 +1526,130 @@ const handler: ExportedHandler<Env> = {
         } catch (e: any) {
           return json({ error: e.message }, 502);
         }
+      }
+
+      // --- DEX ---
+
+      if (request.method === 'POST' && path === '/v1/dex/swap') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const fromToken = (body.fromToken as string || '').toUpperCase();
+        const toToken = (body.toToken as string || '').toUpperCase();
+        const amount = body.amount as string;
+        const priceRateNano = body.priceRateNano as string;
+
+        if (!fromToken || !toToken || !amount || !priceRateNano) {
+          return json({ error: 'Missing required fields: fromToken, toToken, amount, priceRateNano' }, 400);
+        }
+
+        const pair = `${fromToken}/${toToken}`;
+        const pool = await loadDexPool(env.PENDING_STORE, pair);
+        if (!pool) {
+          // Try reverse pair
+          const reversePair = `${toToken}/${fromToken}`;
+          const reversePool = await loadDexPool(env.PENDING_STORE, reversePair);
+          if (!reversePool) {
+            const availablePools = await listDexPools(env.PENDING_STORE);
+            const pairList = availablePools.map(p => p.pair).join(', ') || 'none configured';
+            return json({ error: `Pool ${pair} not found. Available: ${pairList}` }, 404);
+          }
+        }
+
+        const activePool = pool || (await loadDexPool(env.PENDING_STORE, `${toToken}/${fromToken}`))!;
+
+        try {
+          // Import the order builder
+          const { buildTonOrderPayload, buildJettonOrderPayload } = await import('./services/open4devOrderBook');
+
+          let orderResult: { to: string; amountNano: string; payloadBoc: string };
+
+          if (activePool.direction === 'ton' || fromToken === 'TON') {
+            // Selling TON for jetton
+            orderResult = buildTonOrderPayload({
+              dexVaultTonAddress: activePool.dexVaultAddress,
+              sendValueNano: amount,
+              orderAmountNano: amount,
+              priceRateNano,
+              slippage: activePool.slippage,
+              toJettonMinter: activePool.jettonMinter,
+              providerFeeAddress: activePool.providerFeeAddress,
+              feeNum: activePool.feeNum,
+              feeDenom: activePool.feeDenom,
+              matcherFeeNum: activePool.matcherFeeNum,
+              matcherFeeDenom: activePool.matcherFeeDenom,
+              oppositeVaultAddress: activePool.oppositeVaultAddress,
+            });
+          } else {
+            // Selling jetton for TON
+            // Need jetton wallet address for the user
+            const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+            const jettons = await tonapiClient.getJettonBalances(user.address);
+            const jetton = (jettons.balances || []).find((b: any) =>
+              b.jetton?.symbol?.toUpperCase() === fromToken ||
+              b.jetton?.name?.toUpperCase() === fromToken
+            );
+            if (!jetton) {
+              return json({ error: `You don't hold ${fromToken} tokens` }, 400);
+            }
+
+            orderResult = buildJettonOrderPayload({
+              jettonWalletAddress: jetton.wallet_address?.address || jetton.jetton?.address,
+              attachedTonAmountNano: '300000000', // 0.3 TON for gas
+              jettonAmountNano: amount,
+              dexVaultAddress: activePool.dexVaultAddress,
+              ownerAddress: user.address,
+              forwardTonAmountNano: '250000000', // 0.25 TON forward
+              priceRateNano,
+              slippage: activePool.slippage,
+              toJettonMinter: activePool.jettonMinter,
+              providerFeeAddress: activePool.providerFeeAddress,
+              feeNum: activePool.feeNum,
+              feeDenom: activePool.feeDenom,
+              matcherFeeNum: activePool.matcherFeeNum,
+              matcherFeeDenom: activePool.matcherFeeDenom,
+              oppositeVaultAddress: activePool.oppositeVaultAddress,
+            });
+          }
+
+          // Create safe transfer request
+          const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, orderResult.to, orderResult.amountNano, orderResult.payloadBoc);
+
+          // Auto-push to wallet
+          try {
+            const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
+            if (tcSession) {
+              await bridgeSendTransaction(tcSession, req.id, orderResult.to, orderResult.amountNano, orderResult.payloadBoc);
+            }
+          } catch {}
+
+          return json({
+            ...req,
+            swap: { fromToken, toToken, amount, priceRateNano, pool: activePool.pair },
+          });
+        } catch (e: any) {
+          return json({ error: e.message }, 400);
+        }
+      }
+
+      if (request.method === 'GET' && path === '/v1/dex/pools') {
+        const pools = await listDexPools(env.PENDING_STORE);
+        return json({ pools: pools.map(p => ({ pair: p.pair, direction: p.direction })) });
+      }
+
+      if (request.method === 'POST' && path === '/v1/dex/pool') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const config = body as unknown as DexPoolConfig;
+        if (!config.pair || !config.dexVaultAddress) {
+          return json({ error: 'Missing required pool config fields' }, 400);
+        }
+
+        await saveDexPool(env.PENDING_STORE, config.pair, config);
+        return json({ ok: true, pair: config.pair });
       }
 
       // --- Safe TX ---
