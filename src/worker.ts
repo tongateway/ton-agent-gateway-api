@@ -242,8 +242,8 @@ const DEX_JETTON_MINTERS: Record<string, string> = {
   'DOGS':  '0:afc49cb8786f21c87045b19ede78fc14b3257e54302a1f7c0e5228a26e6de710',
 };
 
-const DEX_DEFAULT_FEE_ADDRESS = '0:9d43c795736f88570d78da16160ac946dfb9c2142967e5afa03e201877680c02';
-const DEX_DEFAULT_SLIPPAGE = 50;
+const DEX_DEFAULT_FEE_ADDRESS = '0:250b6998bae9a23f5690ff2333a759985181bc875dc973871d99602106a6aa99';
+const DEX_DEFAULT_SLIPPAGE = 100; // 1%
 
 function getDexPair(fromToken: string, toToken: string): DexPairConfig | null {
   const from = fromToken.toUpperCase();
@@ -260,10 +260,10 @@ function getDexPair(fromToken: string, toToken: string): DexPairConfig | null {
     oppositeVaultAddress: toVault,
     jettonMinter: isTonSell ? (DEX_JETTON_MINTERS[to] ?? '') : (DEX_JETTON_MINTERS[from] ?? ''),
     providerFeeAddress: DEX_DEFAULT_FEE_ADDRESS,
-    feeNum: 0,
-    feeDenom: 1000,
-    matcherFeeNum: 0,
-    matcherFeeDenom: 1000,
+    feeNum: 100,
+    feeDenom: 10000,
+    matcherFeeNum: 200,
+    matcherFeeDenom: 10000,
     slippage: DEX_DEFAULT_SLIPPAGE,
   };
 }
