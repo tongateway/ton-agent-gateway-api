@@ -209,7 +209,7 @@ async function listAgentWallets(kv: KVNamespace, adminAddress: string): Promise<
 
 // --- DEX Pool Config ---
 
-interface DexPoolConfig {
+interface DexPairConfig {
   pair: string;            // e.g. "NOT/TON"
   direction: 'ton' | 'jetton'; // which side we're selling
   dexVaultAddress: string;
@@ -223,18 +223,18 @@ interface DexPoolConfig {
   slippage: number;        // default slippage
 }
 
-async function saveDexPool(kv: KVNamespace, pair: string, config: DexPoolConfig): Promise<void> {
+async function saveDexPair(kv: KVNamespace, pair: string, config: DexPairConfig): Promise<void> {
   await kv.put(`dex:${pair.toUpperCase()}`, JSON.stringify(config));
 }
 
-async function loadDexPool(kv: KVNamespace, pair: string): Promise<DexPoolConfig | null> {
+async function loadDexPair(kv: KVNamespace, pair: string): Promise<DexPairConfig | null> {
   const raw = await kv.get(`dex:${pair.toUpperCase()}`);
   return raw ? JSON.parse(raw) : null;
 }
 
-async function listDexPools(kv: KVNamespace): Promise<DexPoolConfig[]> {
+async function listDexPairs(kv: KVNamespace): Promise<DexPairConfig[]> {
   const list = await kv.list({ prefix: 'dex:' });
-  const pools: DexPoolConfig[] = [];
+  const pools: DexPairConfig[] = [];
   for (const key of list.keys) {
     const raw = await kv.get(key.name);
     if (raw) pools.push(JSON.parse(raw));
@@ -976,10 +976,10 @@ const OPENAPI_SPEC = {
             amount: { type: 'string', description: 'Amount in smallest unit (nanoTON or jetton decimals)' },
             priceRateNano: { type: 'string', description: 'Price rate in nanoTON' },
           } } } } },
-        responses: { '200': { description: 'Swap order created' }, '404': { description: 'Pool not found' } } } },
-    '/v1/dex/pools': {
-      get: { summary: 'List available pools', description: 'List all configured DEX trading pairs.', tags: ['DEX'],
-        responses: { '200': { description: 'Pool list' } } } },
+        responses: { '200': { description: 'Swap order created' }, '404': { description: 'Pair not found' } } } },
+    '/v1/dex/pairs': {
+      get: { summary: 'List available pairs', description: 'List all configured DEX trading pairs.', tags: ['DEX'],
+        responses: { '200': { description: 'Pair list' } } } },
   },
 };
 
@@ -1545,19 +1545,19 @@ const handler: ExportedHandler<Env> = {
         }
 
         const pair = `${fromToken}/${toToken}`;
-        const pool = await loadDexPool(env.PENDING_STORE, pair);
+        const pool = await loadDexPair(env.PENDING_STORE, pair);
         if (!pool) {
           // Try reverse pair
           const reversePair = `${toToken}/${fromToken}`;
-          const reversePool = await loadDexPool(env.PENDING_STORE, reversePair);
+          const reversePool = await loadDexPair(env.PENDING_STORE, reversePair);
           if (!reversePool) {
-            const availablePools = await listDexPools(env.PENDING_STORE);
+            const availablePools = await listDexPairs(env.PENDING_STORE);
             const pairList = availablePools.map(p => p.pair).join(', ') || 'none configured';
             return json({ error: `Pool ${pair} not found. Available: ${pairList}` }, 404);
           }
         }
 
-        const activePool = pool || (await loadDexPool(env.PENDING_STORE, `${toToken}/${fromToken}`))!;
+        const activePool = pool || (await loadDexPair(env.PENDING_STORE, `${toToken}/${fromToken}`))!;
 
         try {
           // Import the order builder
@@ -1633,8 +1633,8 @@ const handler: ExportedHandler<Env> = {
         }
       }
 
-      if (request.method === 'GET' && path === '/v1/dex/pools') {
-        const pools = await listDexPools(env.PENDING_STORE);
+      if (request.method === 'GET' && path === '/v1/dex/pairs') {
+        const pools = await listDexPairs(env.PENDING_STORE);
         return json({ pools: pools.map(p => ({ pair: p.pair, direction: p.direction })) });
       }
 
@@ -1643,12 +1643,12 @@ const handler: ExportedHandler<Env> = {
         if (!user) return json({ error: 'Unauthorized' }, 401);
 
         const body = await parseJson(request) as Record<string, unknown>;
-        const config = body as unknown as DexPoolConfig;
+        const config = body as unknown as DexPairConfig;
         if (!config.pair || !config.dexVaultAddress) {
-          return json({ error: 'Missing required pool config fields' }, 400);
+          return json({ error: 'Missing required pair config fields' }, 400);
         }
 
-        await saveDexPool(env.PENDING_STORE, config.pair, config);
+        await saveDexPair(env.PENDING_STORE, config.pair, config);
         return json({ ok: true, pair: config.pair });
       }
 
