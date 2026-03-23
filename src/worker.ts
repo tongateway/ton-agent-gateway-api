@@ -223,23 +223,60 @@ interface DexPairConfig {
   slippage: number;        // default slippage
 }
 
-async function saveDexPair(kv: KVNamespace, pair: string, config: DexPairConfig): Promise<void> {
-  await kv.put(`dex:${pair.toUpperCase()}`, JSON.stringify(config));
+// Hardcoded open4dev vault addresses
+const DEX_VAULTS: Record<string, string> = {
+  'TON':   'EQCoNUjjTEfzMAITVIPTUjSROXOiqS1K4vNAq9LW0EWNb1bg',
+  'NOT':   'EQD7vaWSbY38DqQ0zY2hNvagO2M-AuL7InUHN4_x2ThceN6J',
+  'USDT':  'EQBrozHGTEwumr5ND62CpUXqmfYyi1UucbIj-15ZJnlFLe9U',
+  'DOGS':  'EQCzqK8_LNpqyXviutwVJUhw30FcAs6YL8HO9cMNCEaAybpt',
+  'BUILD': 'EQDJ-N9sbbh2vNmbJ9DANEWpHdZqW2y8qAAnoBS5rY9fVdLO',
+  'CBBTC': 'EQCYdHD4Pwz5ZtDlyCmSc5XjnfefXeAK2TE1Vz356xr6ILSZ',
+  'PX':    'EQA6kzh2-YZbJa5L9PUu7dDCQDs52-uVQDxBIXFFp6b0ATmZ',
+  'XAUT0': 'EQA9cFoL4hcjOsMTYHHxG0hNyGoikG11oabAQuVQwRKFUhq5',
+  'AGNT':  'EQCfzBzukuhvyXvKwFXq9nffu_YRngAJugAuR5ibQ7Arcl1w',
+};
+
+const DEX_JETTON_MINTERS: Record<string, string> = {
+  'NOT':   '0:2f956143c461769579baef2e32cc2d7bc18283f40d20bb03e432cd603ac33ffc',
+  'USDT':  '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe',
+  'DOGS':  '0:afc49cb8786f21c87045b19ede78fc14b3257e54302a1f7c0e5228a26e6de710',
+};
+
+const DEX_DEFAULT_FEE_ADDRESS = '0:9d43c795736f88570d78da16160ac946dfb9c2142967e5afa03e201877680c02';
+const DEX_DEFAULT_SLIPPAGE = 50;
+
+function getDexPair(fromToken: string, toToken: string): DexPairConfig | null {
+  const from = fromToken.toUpperCase();
+  const to = toToken.toUpperCase();
+  const fromVault = DEX_VAULTS[from];
+  const toVault = DEX_VAULTS[to];
+  if (!fromVault || !toVault) return null;
+
+  const isTonSell = from === 'TON';
+  return {
+    pair: `${from}/${to}`,
+    direction: isTonSell ? 'ton' : 'jetton',
+    dexVaultAddress: fromVault,
+    oppositeVaultAddress: toVault,
+    jettonMinter: isTonSell ? (DEX_JETTON_MINTERS[to] ?? '') : (DEX_JETTON_MINTERS[from] ?? ''),
+    providerFeeAddress: DEX_DEFAULT_FEE_ADDRESS,
+    feeNum: 0,
+    feeDenom: 1000,
+    matcherFeeNum: 0,
+    matcherFeeDenom: 1000,
+    slippage: DEX_DEFAULT_SLIPPAGE,
+  };
 }
 
-async function loadDexPair(kv: KVNamespace, pair: string): Promise<DexPairConfig | null> {
-  const raw = await kv.get(`dex:${pair.toUpperCase()}`);
-  return raw ? JSON.parse(raw) : null;
-}
-
-async function listDexPairs(kv: KVNamespace): Promise<DexPairConfig[]> {
-  const list = await kv.list({ prefix: 'dex:' });
-  const pools: DexPairConfig[] = [];
-  for (const key of list.keys) {
-    const raw = await kv.get(key.name);
-    if (raw) pools.push(JSON.parse(raw));
+function listAvailablePairs(): string[] {
+  const tokens = Object.keys(DEX_VAULTS);
+  const pairs: string[] = [];
+  for (const a of tokens) {
+    for (const b of tokens) {
+      if (a !== b) pairs.push(`${a}/${b}`);
+    }
   }
-  return pools;
+  return pairs;
 }
 
 // --- Agent Auth Flow ---
@@ -1544,20 +1581,10 @@ const handler: ExportedHandler<Env> = {
           return json({ error: 'Missing required fields: fromToken, toToken, amount, priceRateNano' }, 400);
         }
 
-        const pair = `${fromToken}/${toToken}`;
-        const pool = await loadDexPair(env.PENDING_STORE, pair);
-        if (!pool) {
-          // Try reverse pair
-          const reversePair = `${toToken}/${fromToken}`;
-          const reversePool = await loadDexPair(env.PENDING_STORE, reversePair);
-          if (!reversePool) {
-            const availablePools = await listDexPairs(env.PENDING_STORE);
-            const pairList = availablePools.map(p => p.pair).join(', ') || 'none configured';
-            return json({ error: `Pool ${pair} not found. Available: ${pairList}` }, 404);
-          }
+        const activePool = getDexPair(fromToken, toToken);
+        if (!activePool) {
+          return json({ error: `Pair ${fromToken}/${toToken} not found. Available tokens: ${Object.keys(DEX_VAULTS).join(', ')}` }, 404);
         }
-
-        const activePool = pool || (await loadDexPair(env.PENDING_STORE, `${toToken}/${fromToken}`))!;
 
         try {
           // Import the order builder
@@ -1634,22 +1661,7 @@ const handler: ExportedHandler<Env> = {
       }
 
       if (request.method === 'GET' && path === '/v1/dex/pairs') {
-        const pools = await listDexPairs(env.PENDING_STORE);
-        return json({ pools: pools.map(p => ({ pair: p.pair, direction: p.direction })) });
-      }
-
-      if (request.method === 'POST' && path === '/v1/dex/pool') {
-        const user = await authenticate(request, env);
-        if (!user) return json({ error: 'Unauthorized' }, 401);
-
-        const body = await parseJson(request) as Record<string, unknown>;
-        const config = body as unknown as DexPairConfig;
-        if (!config.pair || !config.dexVaultAddress) {
-          return json({ error: 'Missing required pair config fields' }, 400);
-        }
-
-        await saveDexPair(env.PENDING_STORE, config.pair, config);
-        return json({ ok: true, pair: config.pair });
+        return json({ tokens: Object.keys(DEX_VAULTS), pairs: listAvailablePairs() });
       }
 
       // --- Safe TX ---
