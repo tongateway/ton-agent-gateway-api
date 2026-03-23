@@ -967,7 +967,7 @@ const OPENAPI_SPEC = {
       get: { summary: 'Get agent wallet info', description: 'Get balance, seqno, and agent key status.', tags: ['Agent Wallet'], security: [{ bearerAuth: [] }],
         parameters: [{ name: 'address', in: 'path', required: true, schema: { type: 'string' } }],
         responses: { '200': { description: 'Wallet info' } } } },
-    '/v1/dex/swap': {
+    '/v1/dex/order': {
       post: { summary: 'Create swap order', description: 'Swap tokens via open4dev DEX. Agent provides token pair, amount, and price.', tags: ['DEX'], security: [{ bearerAuth: [] }],
         requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['fromToken', 'toToken', 'amount', 'priceRateNano'],
           properties: {
@@ -1530,7 +1530,7 @@ const handler: ExportedHandler<Env> = {
 
       // --- DEX ---
 
-      if (request.method === 'POST' && path === '/v1/dex/swap') {
+      if (request.method === 'POST' && path === '/v1/dex/order') {
         const user = await authenticate(request, env);
         if (!user) return json({ error: 'Unauthorized' }, 401);
 
