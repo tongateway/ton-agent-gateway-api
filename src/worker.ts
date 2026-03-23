@@ -1132,7 +1132,7 @@ const handler: ExportedHandler<Env> = {
         const baseUrl = new URL(request.url).origin.replace('api.', '');
         return json({
           authId: authReq.authId,
-          authUrl: `https://tongateway.ai/connect.html?authId=${authReq.authId}`,
+          authUrl: `https://tongateway.ai/connect?authId=${authReq.authId}`,
           expiresAt: authReq.expiresAt,
           label,
         });
