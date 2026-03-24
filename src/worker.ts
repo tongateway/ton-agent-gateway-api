@@ -240,6 +240,7 @@ const DEX_JETTON_MINTERS: Record<string, string> = {
   'NOT':   '0:2f956143c461769579baef2e32cc2d7bc18283f40d20bb03e432cd603ac33ffc',
   'USDT':  '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe',
   'DOGS':  '0:afc49cb8786f21c87045b19ede78fc14b3257e54302a1f7c0e5228a26e6de710',
+  'AGNT':  '0:9fcc1cee92e86fc97bcac055eaf677dfbbf6119e0009ba002e47989b43b02b72',
 };
 
 const DEX_DEFAULT_FEE_ADDRESS = '0:250b6998bae9a23f5690ff2333a759985181bc875dc973871d99602106a6aa99';
@@ -258,7 +259,7 @@ function getDexPair(fromToken: string, toToken: string): DexPairConfig | null {
     direction: isTonSell ? 'ton' : 'jetton',
     dexVaultAddress: fromVault,
     oppositeVaultAddress: toVault,
-    jettonMinter: isTonSell ? (DEX_JETTON_MINTERS[to] ?? '') : (DEX_JETTON_MINTERS[from] ?? ''),
+    jettonMinter: DEX_JETTON_MINTERS[to] ?? '',  // target token minter (what we're buying)
     providerFeeAddress: DEX_DEFAULT_FEE_ADDRESS,
     feeNum: 100,
     feeDenom: 10000,
