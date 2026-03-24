@@ -246,6 +246,38 @@ const DEX_JETTON_MINTERS: Record<string, string> = {
 const DEX_DEFAULT_FEE_ADDRESS = '0:250b6998bae9a23f5690ff2333a759985181bc875dc973871d99602106a6aa99';
 const DEX_DEFAULT_SLIPPAGE = 100; // 1%
 
+const TOKEN_DECIMALS: Record<string, number> = {
+  TON: 9, NOT: 9, BUILD: 9, DOGS: 9, PX: 9, AGNT: 9, CBBTC: 9,
+  USDT: 6, XAUT0: 6,
+};
+
+function getTokenDecimals(symbol: string): number {
+  return TOKEN_DECIMALS[symbol.toUpperCase()] ?? 9;
+}
+
+function calculatePriceRate(price: number, toDecimals: number, fromDecimals: number): bigint {
+  // Convert to 18-decimal base
+  const priceStr = price.toFixed(18);
+  const [whole, frac = ''] = priceStr.split('.');
+  const paddedFrac = frac.padEnd(18, '0').slice(0, 18);
+  const priceRateBase = BigInt(whole + paddedFrac);
+
+  // Adjust for decimal difference
+  if (fromDecimals > toDecimals) {
+    const diff = fromDecimals - toDecimals;
+    return priceRateBase / BigInt(10 ** diff);
+  } else if (fromDecimals < toDecimals) {
+    const diff = toDecimals - fromDecimals;
+    return priceRateBase * BigInt(10 ** diff);
+  }
+  return priceRateBase;
+}
+
+function calculateSlippage(slippagePercent: number): bigint {
+  // 1% = 10^7, stored as uint30
+  return BigInt(Math.floor(slippagePercent * 10_000_000));
+}
+
 function getDexPair(fromToken: string, toToken: string): DexPairConfig | null {
   const from = fromToken.toUpperCase();
   const to = toToken.toUpperCase();
@@ -1007,12 +1039,12 @@ const OPENAPI_SPEC = {
         responses: { '200': { description: 'Wallet info' } } } },
     '/v1/dex/order': {
       post: { summary: 'Create swap order', description: 'Swap tokens via open4dev DEX. Agent provides token pair, amount, and price.', tags: ['DEX'], security: [{ bearerAuth: [] }],
-        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['fromToken', 'toToken', 'amount', 'priceRateNano'],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['fromToken', 'toToken', 'amount', 'price'],
           properties: {
             fromToken: { type: 'string', description: 'Token to sell (e.g. "NOT", "TON")' },
             toToken: { type: 'string', description: 'Token to buy (e.g. "TON", "NOT")' },
             amount: { type: 'string', description: 'Amount in smallest unit (nanoTON or jetton decimals)' },
-            priceRateNano: { type: 'string', description: 'Price rate in nanoTON' },
+            price: { type: 'number', description: 'Human-readable price (e.g. 20 for "1 USDT = 20 AGNT")' },
           } } } } },
         responses: { '200': { description: 'Swap order created' }, '404': { description: 'Pair not found' } } } },
     '/v1/dex/pairs': {
@@ -1576,11 +1608,20 @@ const handler: ExportedHandler<Env> = {
         const fromToken = (body.fromToken as string || '').toUpperCase();
         const toToken = (body.toToken as string || '').toUpperCase();
         const amount = body.amount as string;
-        const priceRateNano = body.priceRateNano as string;
+        const price = Number(body.price);
 
-        if (!fromToken || !toToken || !amount || !priceRateNano) {
-          return json({ error: 'Missing required fields: fromToken, toToken, amount, priceRateNano' }, 400);
+        if (!fromToken || !toToken || !amount || !price || isNaN(price) || price <= 0) {
+          return json({ error: 'Missing required fields: fromToken, toToken, amount, price (human-readable, e.g. 20 for "1 USDT = 20 AGNT")' }, 400);
         }
+
+        // Calculate price rate and slippage with correct decimal handling
+        const fromDecimals = getTokenDecimals(fromToken);
+        const toDecimals = getTokenDecimals(toToken);
+        const priceRateNano = calculatePriceRate(price, toDecimals, fromDecimals).toString();
+
+        // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
+        const effectiveSlippage = 1 + 1 + 2; // 4%
+        const slippageValue = Number(calculateSlippage(effectiveSlippage));
 
         const activePool = getDexPair(fromToken, toToken);
         if (!activePool) {
@@ -1597,10 +1638,10 @@ const handler: ExportedHandler<Env> = {
             // Selling TON for jetton
             orderResult = buildTonOrderPayload({
               dexVaultTonAddress: activePool.dexVaultAddress,
-              sendValueNano: amount,
+              sendValueNano: (BigInt(amount) + 100000000n).toString(),
               orderAmountNano: amount,
               priceRateNano,
-              slippage: activePool.slippage,
+              slippage: slippageValue,
               toJettonMinter: activePool.jettonMinter,
               providerFeeAddress: activePool.providerFeeAddress,
               feeNum: activePool.feeNum,
@@ -1628,13 +1669,13 @@ const handler: ExportedHandler<Env> = {
 
             orderResult = buildJettonOrderPayload({
               jettonWalletAddress: jetton.wallet_address?.address ?? jetton.wallet_address ?? jetton.jetton?.address,
-              attachedTonAmountNano: '300000000', // 0.3 TON for gas
+              attachedTonAmountNano: '150000000', // 0.15 TON for gas
               jettonAmountNano: amount,
               dexVaultAddress: activePool.dexVaultAddress,
               ownerAddress: user.address,
-              forwardTonAmountNano: '250000000', // 0.25 TON forward
+              forwardTonAmountNano: '100000000', // 0.1 TON forward
               priceRateNano,
-              slippage: activePool.slippage,
+              slippage: slippageValue,
               toJettonMinter: activePool.jettonMinter,
               providerFeeAddress: activePool.providerFeeAddress,
               feeNum: activePool.feeNum,
@@ -1658,7 +1699,7 @@ const handler: ExportedHandler<Env> = {
 
           return json({
             ...req,
-            swap: { fromToken, toToken, amount, priceRateNano, pool: activePool.pair },
+            swap: { fromToken, toToken, amount, price, priceRateNano, slippage: effectiveSlippage, pool: activePool.pair },
           });
         } catch (e: any) {
           return json({ error: e.message }, 400);
