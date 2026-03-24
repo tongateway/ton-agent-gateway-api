@@ -1614,16 +1614,20 @@ const handler: ExportedHandler<Env> = {
             // Need jetton wallet address for the user
             const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
             const jettons = await tonapiClient.getJettonBalances(user.address);
+            // Match by symbol, name, or minter address (handles special chars like USD₮)
+            const fromMinter = DEX_JETTON_MINTERS[fromToken] ?? '';
             const jetton = (jettons.balances || []).find((b: any) =>
               b.jetton?.symbol?.toUpperCase() === fromToken ||
-              b.jetton?.name?.toUpperCase() === fromToken
+              b.jetton?.name?.toUpperCase() === fromToken ||
+              b.jetton?.symbol?.replace(/[^A-Z0-9]/gi, '').toUpperCase() === fromToken ||
+              (fromMinter && b.jetton?.address === fromMinter)
             );
             if (!jetton) {
               return json({ error: `You don't hold ${fromToken} tokens` }, 400);
             }
 
             orderResult = buildJettonOrderPayload({
-              jettonWalletAddress: jetton.wallet_address?.address || jetton.jetton?.address,
+              jettonWalletAddress: jetton.wallet_address?.address ?? jetton.wallet_address ?? jetton.jetton?.address,
               attachedTonAmountNano: '300000000', // 0.3 TON for gas
               jettonAmountNano: amount,
               dexVaultAddress: activePool.dexVaultAddress,
