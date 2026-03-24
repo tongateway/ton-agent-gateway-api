@@ -318,7 +318,7 @@ async function completeAuthRequest(kv: KVNamespace, authId: string, token: strin
   req.token = token;
   req.address = address;
   req.sessionId = sessionId;
-  await kv.put(`auth:${authId}`, JSON.stringify(req), { expirationTtl: 3600 }); // keep for 1 hour after completion
+  await kv.put(`auth:${authId}`, JSON.stringify(req)); // no TTL — token is permanent
   return req;
 }
 
