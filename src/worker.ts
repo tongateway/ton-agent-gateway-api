@@ -1607,16 +1607,22 @@ const handler: ExportedHandler<Env> = {
         const body = await parseJson(request) as Record<string, unknown>;
         const fromToken = (body.fromToken as string || '').toUpperCase();
         const toToken = (body.toToken as string || '').toUpperCase();
-        const amount = body.amount as string;
+        const amount = Number(body.amount);
         const price = Number(body.price);
 
-        if (!fromToken || !toToken || !amount || !price || isNaN(price) || price <= 0) {
-          return json({ error: 'Missing required fields: fromToken, toToken, amount, price (human-readable, e.g. 20 for "1 USDT = 20 AGNT")' }, 400);
+        if (!fromToken || !toToken || !amount || isNaN(amount) || amount <= 0 || !price || isNaN(price) || price <= 0) {
+          return json({ error: 'Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)' }, 400);
         }
 
-        // Calculate price rate and slippage with correct decimal handling
+        // Calculate price rate and amount with correct decimal handling
         const fromDecimals = getTokenDecimals(fromToken);
         const toDecimals = getTokenDecimals(toToken);
+
+        // Convert human-readable amount to raw units
+        const amountStr = amount.toFixed(fromDecimals);
+        const [amountWhole, amountFrac = ''] = amountStr.split('.');
+        const amountRaw = BigInt(amountWhole + amountFrac.padEnd(fromDecimals, '0').slice(0, fromDecimals)).toString();
+
         const priceRateNano = calculatePriceRate(price, toDecimals, fromDecimals).toString();
 
         // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
@@ -1638,8 +1644,8 @@ const handler: ExportedHandler<Env> = {
             // Selling TON for jetton
             orderResult = buildTonOrderPayload({
               dexVaultTonAddress: activePool.dexVaultAddress,
-              sendValueNano: (BigInt(amount) + 100000000n).toString(),
-              orderAmountNano: amount,
+              sendValueNano: (BigInt(amountRaw) + 100000000n).toString(),
+              orderAmountNano: amountRaw,
               priceRateNano,
               slippage: slippageValue,
               toJettonMinter: activePool.jettonMinter,
@@ -1670,7 +1676,7 @@ const handler: ExportedHandler<Env> = {
             orderResult = buildJettonOrderPayload({
               jettonWalletAddress: jetton.wallet_address?.address ?? jetton.wallet_address ?? jetton.jetton?.address,
               attachedTonAmountNano: '150000000', // 0.15 TON for gas
-              jettonAmountNano: amount,
+              jettonAmountNano: amountRaw,
               dexVaultAddress: activePool.dexVaultAddress,
               ownerAddress: user.address,
               forwardTonAmountNano: '100000000', // 0.1 TON forward
@@ -1699,7 +1705,7 @@ const handler: ExportedHandler<Env> = {
 
           return json({
             ...req,
-            swap: { fromToken, toToken, amount, price, priceRateNano, slippage: effectiveSlippage, pool: activePool.pair },
+            swap: { fromToken, toToken, amount, amountRaw, price, priceRateNano, slippage: effectiveSlippage, pool: activePool.pair },
           });
         } catch (e: any) {
           return json({ error: e.message }, 400);
