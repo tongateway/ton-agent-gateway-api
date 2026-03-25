@@ -2,7 +2,7 @@ import {
   buildSignedTransferMessage,
   wrapSignedBodyIntoExternalMessage,
 } from './services/tonMessage';
-import { TcSession, bridgeSendTransaction, bridgePollResponses, BridgeResponse } from './bridge';
+import { TcSession, bridgeSendTransaction, bridgeSendMessages, bridgePollResponses, BridgeResponse } from './bridge';
 import { SignAndExecuteSchema, ExecuteSignedSchema, RawExecuteSchema } from './schemas/tx';
 import { resolveSecretKeyFromHex } from './utils/keys';
 import { toSafeNumber } from './utils/numbers';
@@ -1746,6 +1746,52 @@ const handler: ExportedHandler<Env> = {
       }
 
       // --- Safe TX ---
+
+      if (request.method === 'POST' && path === '/v1/safe/tx/batch') {
+        const user = await authenticate(request, env);
+        if (!user) return json({ error: 'Unauthorized' }, 401);
+
+        const body = await parseJson(request) as Record<string, unknown>;
+        const transfers = body.transfers as Array<{ to: string; amountNano: string; payload?: string; comment?: string }>;
+        if (!transfers || !Array.isArray(transfers) || !transfers.length) {
+          return json({ error: 'Missing transfers array' }, 400);
+        }
+        if (transfers.length > 4) {
+          return json({ error: 'Max 4 transfers per batch (v4 wallet limit). Use agent_wallet.batch_transfer for more.' }, 400);
+        }
+
+        // Build messages for TON Connect
+        const messages: Array<{ address: string; amount: string; payload?: string }> = [];
+        for (const t of transfers) {
+          if (!t.to || !t.amountNano) {
+            return json({ error: 'Each transfer needs to and amountNano' }, 400);
+          }
+          messages.push({
+            address: t.to,
+            amount: t.amountNano,
+            ...(t.payload ? { payload: t.payload } : {}),
+          });
+        }
+
+        // Create a single pending request for tracking
+        const totalNano = transfers.reduce((sum, t) => (BigInt(sum) + BigInt(t.amountNano)).toString(), '0');
+        const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, transfers[0].to, totalNano);
+
+        // Push all messages as one transaction to wallet
+        try {
+          const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
+          if (tcSession) {
+            await bridgeSendMessages(tcSession, req.id, messages);
+          }
+        } catch (e) {
+          console.error('Bridge batch send failed:', e);
+        }
+
+        return json({
+          ...req,
+          batch: { count: transfers.length, totalNano },
+        });
+      }
 
       if (request.method === 'POST' && path === '/v1/safe/tx/transfer') {
         const user = await authenticate(request, env);

@@ -72,6 +72,13 @@ function decrypt(message: Uint8Array, secretKey: Uint8Array, senderPublicKey: Ui
 /**
  * Send a sendTransaction request to the wallet via the TON Connect bridge.
  */
+export interface BridgeMessage {
+  address: string;
+  amount: string;
+  payload?: string;
+  stateInit?: string;
+}
+
 export async function bridgeSendTransaction(
   session: TcSession,
   requestId: string,
@@ -80,14 +87,22 @@ export async function bridgeSendTransaction(
   payload?: string,
   stateInit?: string,
 ): Promise<void> {
+  return bridgeSendMessages(session, requestId, [{
+    address: to,
+    amount: amountNano,
+    ...(payload ? { payload } : {}),
+    ...(stateInit ? { stateInit } : {}),
+  }]);
+}
+
+export async function bridgeSendMessages(
+  session: TcSession,
+  requestId: string,
+  messages: BridgeMessage[],
+): Promise<void> {
   const transaction = {
     valid_until: Math.floor(Date.now() / 1000) + 300,
-    messages: [{
-      address: to,
-      amount: amountNano,
-      ...(payload ? { payload: payload } : {}),
-      ...(stateInit ? { stateInit } : {}),
-    }],
+    messages,
   };
 
   const request: SendTransactionRequest = {
