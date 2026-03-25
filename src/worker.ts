@@ -322,16 +322,28 @@ interface AuthRequest {
   sessionId?: string;
   createdAt: number;
   expiresAt: number;
+  // TC keypair generated server-side for bridge push
+  tcSecretKey?: string;
+  tcPublicKey?: string;
 }
 
 async function createAuthRequest(kv: KVNamespace): Promise<AuthRequest> {
   const authId = crypto.randomUUID();
   const now = Date.now();
+
+  // Generate TC keypair server-side for bridge push
+  const nacl = await import('tweetnacl');
+  const tcKp = nacl.default.box.keyPair();
+  const tcSecretKey = Array.from(tcKp.secretKey).map(b => b.toString(16).padStart(2, '0')).join('');
+  const tcPublicKey = Array.from(tcKp.publicKey).map(b => b.toString(16).padStart(2, '0')).join('');
+
   const req: AuthRequest = {
     authId,
     status: 'pending',
     createdAt: now,
-    expiresAt: now + 10 * 60 * 1000, // 10 minutes TTL
+    expiresAt: now + 10 * 60 * 1000,
+    tcSecretKey,
+    tcPublicKey,
   };
   await kv.put(`auth:${authId}`, JSON.stringify(req), { expirationTtl: 600 });
   return req;
@@ -1205,6 +1217,7 @@ const handler: ExportedHandler<Env> = {
           authUrl: `https://tongateway.ai/connect?authId=${authReq.authId}`,
           expiresAt: authReq.expiresAt,
           label,
+          tcPublicKey: authReq.tcPublicKey,
         });
       }
 
@@ -1244,17 +1257,33 @@ const handler: ExportedHandler<Env> = {
         const token = await jwtSign({ address, sid }, secret);
         await createSession(env.PENDING_STORE, sid, address, label);
 
-        // Save TC session if provided
-        const tcData = body.tcSession as Record<string, unknown> | undefined;
-        if (tcData && tcData.secretKey && tcData.publicKey && tcData.walletPublicKey && tcData.bridgeUrl) {
+        // Save TC session — use server-generated keypair from auth request + wallet public key from connect page
+        const walletPublicKey = body.walletPublicKey as string | undefined;
+        const bridgeUrl = (body.bridgeUrl as string) || 'https://bridge.tonapi.io/bridge';
+
+        if (walletPublicKey && authReq.tcSecretKey && authReq.tcPublicKey) {
+          // Use server-generated keypair (proper fix — no browser extraction needed)
           const tcSession: TcSession = {
-            secretKey: tcData.secretKey as string,
-            publicKey: tcData.publicKey as string,
-            walletPublicKey: tcData.walletPublicKey as string,
-            bridgeUrl: tcData.bridgeUrl as string,
+            secretKey: authReq.tcSecretKey,
+            publicKey: authReq.tcPublicKey,
+            walletPublicKey,
+            bridgeUrl,
             walletAddress: address,
           };
           await saveTcSession(env.PENDING_STORE, address, tcSession);
+        } else {
+          // Fallback: try browser-extracted session
+          const tcData = body.tcSession as Record<string, unknown> | undefined;
+          if (tcData && tcData.secretKey && tcData.publicKey && tcData.walletPublicKey && tcData.bridgeUrl) {
+            const tcSession: TcSession = {
+              secretKey: tcData.secretKey as string,
+              publicKey: tcData.publicKey as string,
+              walletPublicKey: tcData.walletPublicKey as string,
+              bridgeUrl: tcData.bridgeUrl as string,
+              walletAddress: address,
+            };
+            await saveTcSession(env.PENDING_STORE, address, tcSession);
+          }
         }
 
         await completeAuthRequest(env.PENDING_STORE, authId, token, address, sid);
@@ -1770,9 +1799,33 @@ const handler: ExportedHandler<Env> = {
           if (req.status === 'pending') {
             try { await processBridgeResponses(env.PENDING_STORE, user.address, env); } catch {}
             const updated = await kvGetByIdForWallet(env.PENDING_STORE, id, user.address);
-            if (updated) return json(updated);
+            if (updated && updated.status !== 'pending') return json(updated);
+
+            // Fallback: check on-chain if bridge failed
+            try {
+              const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+              const events = await tonapiClient.getTransactions(user.address, 5);
+              const recentTxs = events.events ?? [];
+              for (const tx of recentTxs) {
+                // Match by destination and approximate time
+                const txTime = (tx.timestamp ?? 0) * 1000;
+                if (txTime > req.createdAt - 5000 && txTime < req.expiresAt) {
+                  for (const action of (tx.actions ?? [])) {
+                    if (action.type === 'TonTransfer' || action.type === 'JettonTransfer') {
+                      const dest = action.TonTransfer?.recipient?.address ?? action.JettonTransfer?.recipient?.address ?? '';
+                      if (dest === req.to || dest.includes(req.to.slice(2, 10))) {
+                        req.status = 'confirmed';
+                        req.broadcastResult = 'success';
+                        await kvUpdate(env.PENDING_STORE, req);
+                        return json(req);
+                      }
+                    }
+                  }
+                }
+              }
+            } catch {}
           }
-          return json(req);
+          return json(updated ?? req);
         }
 
         if (action === '/confirm' && request.method === 'POST') {
