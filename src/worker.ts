@@ -1871,7 +1871,7 @@ const handler: ExportedHandler<Env> = {
               }
             } catch {}
           }
-          return json(updated ?? req);
+          return json(req);
         }
 
         if (action === '/confirm' && request.method === 'POST') {
