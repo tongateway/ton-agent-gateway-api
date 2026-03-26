@@ -1826,19 +1826,8 @@ const handler: ExportedHandler<Env> = {
           return json({ error: 'Missing required field: amount or amountNano' }, 400);
         }
 
-        // Build comment payload if provided
+        // Payload: use provided BOC or leave to MCP to encode comments
         let payload = typeof body.payload === 'string' ? body.payload : undefined;
-        if (!payload && body.comment && typeof body.comment === 'string') {
-          // Encode text comment as TON payload: 32 zero bits + UTF-8 text
-          const commentBytes = new TextEncoder().encode(body.comment as string);
-          // Build cell manually: 4 bytes (0x00000000) + text bytes
-          const cellData = new Uint8Array(4 + commentBytes.length);
-          cellData.set(commentBytes, 4); // first 4 bytes are already 0
-          // For simple comments, we can use the raw bytes as payload BOC
-          // Actually we need proper BOC encoding — use base64 of the raw data
-          // TonConnect accepts both BOC and raw payload formats
-          payload = btoa(String.fromCharCode(...cellData));
-        }
 
         const stateInit = typeof body.stateInit === 'string' ? body.stateInit : undefined;
         const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payload, stateInit);
