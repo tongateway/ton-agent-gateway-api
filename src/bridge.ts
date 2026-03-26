@@ -124,12 +124,15 @@ export async function bridgeSendMessages(
   url.searchParams.set('ttl', '300');
   url.searchParams.set('topic', 'sendTransaction');
 
+  console.log('Bridge URL:', url.toString().slice(0, 80));
   const res = await fetch(url.toString(), {
     method: 'POST',
     body,
   });
 
   if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    console.error('Bridge response:', res.status, errBody.slice(0, 200));
     throw new Error(`Bridge send failed: ${res.status}`);
   }
 }
