@@ -1257,33 +1257,20 @@ const handler: ExportedHandler<Env> = {
         const token = await jwtSign({ address, sid }, secret);
         await createSession(env.PENDING_STORE, sid, address, label);
 
-        // Save TC session — use server-generated keypair from auth request + wallet public key from connect page
-        const walletPublicKey = body.walletPublicKey as string | undefined;
-        const bridgeUrl = (body.bridgeUrl as string) || 'https://bridge.tonapi.io/bridge';
-
-        if (walletPublicKey && authReq.tcSecretKey && authReq.tcPublicKey) {
-          // Use server-generated keypair (proper fix — no browser extraction needed)
+        // Save TC session — MUST use TonConnectUI's keypair (what the wallet connected to)
+        const tcData = body.tcSession as Record<string, unknown> | undefined;
+        if (tcData && tcData.secretKey && tcData.publicKey && tcData.walletPublicKey && tcData.bridgeUrl) {
           const tcSession: TcSession = {
-            secretKey: authReq.tcSecretKey,
-            publicKey: authReq.tcPublicKey,
-            walletPublicKey,
-            bridgeUrl,
+            secretKey: tcData.secretKey as string,
+            publicKey: tcData.publicKey as string,
+            walletPublicKey: tcData.walletPublicKey as string,
+            bridgeUrl: tcData.bridgeUrl as string,
             walletAddress: address,
           };
           await saveTcSession(env.PENDING_STORE, address, tcSession);
+          console.log('TC session saved from browser, publicKey:', tcSession.publicKey.slice(0, 8));
         } else {
-          // Fallback: try browser-extracted session
-          const tcData = body.tcSession as Record<string, unknown> | undefined;
-          if (tcData && tcData.secretKey && tcData.publicKey && tcData.walletPublicKey && tcData.bridgeUrl) {
-            const tcSession: TcSession = {
-              secretKey: tcData.secretKey as string,
-              publicKey: tcData.publicKey as string,
-              walletPublicKey: tcData.walletPublicKey as string,
-              bridgeUrl: tcData.bridgeUrl as string,
-              walletAddress: address,
-            };
-            await saveTcSession(env.PENDING_STORE, address, tcSession);
-          }
+          console.log('WARNING: No TC session received from connect page — wallet push will not work');
         }
 
         await completeAuthRequest(env.PENDING_STORE, authId, token, address, sid);
