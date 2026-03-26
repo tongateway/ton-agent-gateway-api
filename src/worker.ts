@@ -1812,7 +1812,11 @@ const handler: ExportedHandler<Env> = {
         try {
           const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
           if (tcSession) {
+            console.log('Bridge push: sending to wallet, session publicKey:', tcSession.publicKey?.slice(0, 8), 'walletPubKey:', tcSession.walletPublicKey?.slice(0, 8));
             await bridgeSendTransaction(tcSession, req.id, to, amountNano, payload, stateInit);
+            console.log('Bridge push: sent successfully');
+          } else {
+            console.log('Bridge push: no TC session found for address', user.address.slice(0, 16));
           }
         } catch (e) {
           console.error('Bridge send failed:', e);
