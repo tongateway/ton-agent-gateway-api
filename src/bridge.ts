@@ -118,7 +118,8 @@ export async function bridgeSendMessages(
   const encrypted = encrypt(JSON.stringify(request), secretKey, walletPubKey);
   const body = naclUtil.encodeBase64(encrypted);
 
-  const url = new URL(`${session.bridgeUrl}/message`);
+  const bridgeBase = session.bridgeUrl.replace(/\/+$/, ''); // strip trailing slashes
+  const url = new URL(`${bridgeBase}/message`);
   url.searchParams.set('client_id', clientId);
   url.searchParams.set('to', session.walletPublicKey);
   url.searchParams.set('ttl', '300');
@@ -145,7 +146,8 @@ export async function bridgePollResponses(
   lastEventId?: string,
 ): Promise<{ responses: BridgeResponse[]; lastEventId?: string }> {
   const clientId = session.publicKey;
-  const url = new URL(`${session.bridgeUrl}/events`);
+  const bridgeBase2 = session.bridgeUrl.replace(/\/+$/, '');
+  const url = new URL(`${bridgeBase2}/events`);
   url.searchParams.set('client_id', clientId);
   if (lastEventId) {
     url.searchParams.set('last_event_id', lastEventId);
