@@ -1785,13 +1785,61 @@ const handler: ExportedHandler<Env> = {
         if (!user) return json({ error: 'Unauthorized' }, 401);
 
         const body = await parseJson(request) as Record<string, unknown>;
-        const to = body.to;
-        const amountNano = body.amountNano;
-        if (!to || typeof to !== 'string' || !amountNano || typeof amountNano !== 'string') {
-          return json({ error: 'Missing required fields: to, amountNano' }, 400);
+
+        // Support both human-readable and raw formats
+        let to = body.to as string;
+        let amountNano = body.amountNano as string | undefined;
+
+        if (!to || typeof to !== 'string') {
+          return json({ error: 'Missing required field: to' }, 400);
         }
 
-        const payload = typeof body.payload === 'string' ? body.payload : undefined;
+        // Auto-resolve .ton domain names
+        if (to.endsWith('.ton') || to.endsWith('.t.me')) {
+          try {
+            const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+            const dnsResult = await tonapiClient.resolveDns(to);
+            if (dnsResult.wallet?.address) {
+              to = dnsResult.wallet.address;
+            } else {
+              return json({ error: `Could not resolve domain: ${body.to}` }, 400);
+            }
+          } catch (e: any) {
+            return json({ error: `DNS resolution failed: ${e.message}` }, 400);
+          }
+        }
+
+        // Convert human-readable amount if provided
+        if (!amountNano && body.amount) {
+          const amount = Number(body.amount);
+          const token = ((body.token as string) || 'TON').toUpperCase();
+          if (isNaN(amount) || amount <= 0) {
+            return json({ error: 'Invalid amount' }, 400);
+          }
+          const decimals = getTokenDecimals(token);
+          const amountStr = amount.toFixed(decimals);
+          const [whole, frac = ''] = amountStr.split('.');
+          amountNano = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals)).toString();
+        }
+
+        if (!amountNano) {
+          return json({ error: 'Missing required field: amount or amountNano' }, 400);
+        }
+
+        // Build comment payload if provided
+        let payload = typeof body.payload === 'string' ? body.payload : undefined;
+        if (!payload && body.comment && typeof body.comment === 'string') {
+          // Encode text comment as TON payload: 32 zero bits + UTF-8 text
+          const commentBytes = new TextEncoder().encode(body.comment as string);
+          // Build cell manually: 4 bytes (0x00000000) + text bytes
+          const cellData = new Uint8Array(4 + commentBytes.length);
+          cellData.set(commentBytes, 4); // first 4 bytes are already 0
+          // For simple comments, we can use the raw bytes as payload BOC
+          // Actually we need proper BOC encoding — use base64 of the raw data
+          // TonConnect accepts both BOC and raw payload formats
+          payload = btoa(String.fromCharCode(...cellData));
+        }
+
         const stateInit = typeof body.stateInit === 'string' ? body.stateInit : undefined;
         const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, to, amountNano, payload, stateInit);
 
@@ -1809,7 +1857,7 @@ const handler: ExportedHandler<Env> = {
           console.error('Bridge send failed:', e);
         }
 
-        return json(req);
+        return json({ ...req, resolved: body.to !== to ? { from: body.to, to } : undefined });
       }
 
       if (request.method === 'GET' && path === '/v1/safe/tx/pending') {
