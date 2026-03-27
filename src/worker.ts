@@ -1671,6 +1671,10 @@ const handler: ExportedHandler<Env> = {
           const messages: Array<{ address: string; amount: string; payload?: string }> = [];
           const swaps: Array<{ fromToken: string; toToken: string; amount: number; amountRaw: string; price: number; priceRateNano: string; slippage: number; pool: string }> = [];
 
+          // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
+          const effectiveSlippage = 1 + 1 + 2; // 4%
+          const slippageValue = Number(calculateSlippage(effectiveSlippage));
+
           for (let i = 0; i < orders.length; i++) {
             const o = orders[i];
 
@@ -1683,10 +1687,6 @@ const handler: ExportedHandler<Env> = {
             const amountRaw = BigInt(amountWhole + amountFrac.padEnd(fromDecimals, '0').slice(0, fromDecimals)).toString();
 
             const priceRateNano = calculatePriceRate(o.price, toDecimals, fromDecimals).toString();
-
-            // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
-            const effectiveSlippage = 1 + 1 + 2; // 4%
-            const slippageValue = Number(calculateSlippage(effectiveSlippage));
 
             const activePool = getDexPair(o.fromToken, o.toToken);
             if (!activePool) {
@@ -1771,7 +1771,9 @@ const handler: ExportedHandler<Env> = {
             if (tcSession) {
               await bridgeSendMessages(tcSession, req.id, messages);
             }
-          } catch {}
+          } catch (e) {
+            console.error('Bridge batch send failed:', e);
+          }
 
           return json({
             ...req,
