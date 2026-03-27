@@ -1626,43 +1626,37 @@ const handler: ExportedHandler<Env> = {
 
         const body = await parseJson(request) as Record<string, unknown>;
 
+        try {
         // Step 1: Normalize input into orders array
         // Accept either { orders: [...] } or flat { fromToken, toToken, amount, price }
         type OrderInput = { fromToken: string; toToken: string; amount: number; price: number };
         let orders: OrderInput[];
 
         if (Array.isArray(body.orders)) {
-          orders = (body.orders as Array<Record<string, unknown>>).map((o) => ({
-            fromToken: (String(o.fromToken || '')).toUpperCase(),
-            toToken: (String(o.toToken || '')).toUpperCase(),
-            amount: Number(o.amount),
-            price: Number(o.price),
-          }));
+          orders = (body.orders as Array<Record<string, unknown>>).map((o, idx) => {
+            const fromToken = (String(o.fromToken || '')).toUpperCase();
+            const toToken = (String(o.toToken || '')).toUpperCase();
+            const amount = Number(o.amount);
+            const price = Number(o.price);
+            if (!fromToken || !toToken || !amount || isNaN(amount) || amount <= 0 || !price || isNaN(price) || price <= 0) {
+              throw new Error(`Order ${idx + 1}: Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)`);
+            }
+            return { fromToken, toToken, amount, price };
+          });
         } else {
-          orders = [{
-            fromToken: (body.fromToken as string || '').toUpperCase(),
-            toToken: (body.toToken as string || '').toUpperCase(),
-            amount: Number(body.amount),
-            price: Number(body.price),
-          }];
+          const fromToken = (body.fromToken as string || '').toUpperCase();
+          const toToken = (body.toToken as string || '').toUpperCase();
+          const amount = Number(body.amount);
+          const price = Number(body.price);
+          if (!fromToken || !toToken || !amount || isNaN(amount) || amount <= 0 || !price || isNaN(price) || price <= 0) {
+            throw new Error('Order 1: Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)');
+          }
+          orders = [{ fromToken, toToken, amount, price }];
         }
 
         if (!orders.length) {
           return json({ error: 'At least one order is required' }, 400);
         }
-        if (orders.length > 4) {
-          return json({ error: 'Max 4 orders per batch (v4 wallet limit)' }, 400);
-        }
-
-        // Validate all orders upfront
-        for (let i = 0; i < orders.length; i++) {
-          const o = orders[i];
-          if (!o.fromToken || !o.toToken || !o.amount || isNaN(o.amount) || o.amount <= 0 || !o.price || isNaN(o.price) || o.price <= 0) {
-            return json({ error: `Order ${i + 1}: Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)` }, 400);
-          }
-        }
-
-        try {
           // Step 2: Loop to build all order payloads
 
           // Fetch jetton balances ONCE if any order sells a jetton (optimization)
