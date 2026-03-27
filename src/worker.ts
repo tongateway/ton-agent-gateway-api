@@ -241,6 +241,10 @@ const DEX_JETTON_MINTERS: Record<string, string> = {
   'USDT':  '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe',
   'DOGS':  '0:afc49cb8786f21c87045b19ede78fc14b3257e54302a1f7c0e5228a26e6de710',
   'AGNT':  '0:9fcc1cee92e86fc97bcac055eaf677dfbbf6119e0009ba002e47989b43b02b72',
+  'BUILD': '0:589d4ac897006b5aaa7fae5f95c5e481bd34765664df0b831a9d0eb9ee7fc150',
+  'CBBTC': '0:e1c8fcdb223253fd69d8de01a9ae349850af5f88632358c7b3c4ef0c66251d7d',
+  'PX':    '0:78db4c90b19a1b19ccb45580df48a1e91b6410970fa3d5ffed3eed49e3cf08ff',
+  'XAUT0': '0:3547f2ee4022c794c80ea354b81bb63b5b571dd05ac091b035d19abbadd74ac6',
 };
 
 const DEX_DEFAULT_FEE_ADDRESS = '0:250b6998bae9a23f5690ff2333a759985181bc875dc973871d99602106a6aa99';
@@ -1621,107 +1625,165 @@ const handler: ExportedHandler<Env> = {
         if (!user) return json({ error: 'Unauthorized' }, 401);
 
         const body = await parseJson(request) as Record<string, unknown>;
-        const fromToken = (body.fromToken as string || '').toUpperCase();
-        const toToken = (body.toToken as string || '').toUpperCase();
-        const amount = Number(body.amount);
-        const price = Number(body.price);
 
-        if (!fromToken || !toToken || !amount || isNaN(amount) || amount <= 0 || !price || isNaN(price) || price <= 0) {
-          return json({ error: 'Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)' }, 400);
+        // Step 1: Normalize input into orders array
+        // Accept either { orders: [...] } or flat { fromToken, toToken, amount, price }
+        type OrderInput = { fromToken: string; toToken: string; amount: number; price: number };
+        let orders: OrderInput[];
+
+        if (Array.isArray(body.orders)) {
+          orders = (body.orders as Array<Record<string, unknown>>).map((o) => ({
+            fromToken: (String(o.fromToken || '')).toUpperCase(),
+            toToken: (String(o.toToken || '')).toUpperCase(),
+            amount: Number(o.amount),
+            price: Number(o.price),
+          }));
+        } else {
+          orders = [{
+            fromToken: (body.fromToken as string || '').toUpperCase(),
+            toToken: (body.toToken as string || '').toUpperCase(),
+            amount: Number(body.amount),
+            price: Number(body.price),
+          }];
         }
 
-        // Calculate price rate and amount with correct decimal handling
-        const fromDecimals = getTokenDecimals(fromToken);
-        const toDecimals = getTokenDecimals(toToken);
+        if (!orders.length) {
+          return json({ error: 'At least one order is required' }, 400);
+        }
+        if (orders.length > 4) {
+          return json({ error: 'Max 4 orders per batch (v4 wallet limit)' }, 400);
+        }
 
-        // Convert human-readable amount to raw units
-        const amountStr = amount.toFixed(fromDecimals);
-        const [amountWhole, amountFrac = ''] = amountStr.split('.');
-        const amountRaw = BigInt(amountWhole + amountFrac.padEnd(fromDecimals, '0').slice(0, fromDecimals)).toString();
-
-        const priceRateNano = calculatePriceRate(price, toDecimals, fromDecimals).toString();
-
-        // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
-        const effectiveSlippage = 1 + 1 + 2; // 4%
-        const slippageValue = Number(calculateSlippage(effectiveSlippage));
-
-        const activePool = getDexPair(fromToken, toToken);
-        if (!activePool) {
-          return json({ error: `Pair ${fromToken}/${toToken} not found. Available tokens: ${Object.keys(DEX_VAULTS).join(', ')}` }, 404);
+        // Validate all orders upfront
+        for (let i = 0; i < orders.length; i++) {
+          const o = orders[i];
+          if (!o.fromToken || !o.toToken || !o.amount || isNaN(o.amount) || o.amount <= 0 || !o.price || isNaN(o.price) || o.price <= 0) {
+            return json({ error: `Order ${i + 1}: Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)` }, 400);
+          }
         }
 
         try {
-          // Import the order builder
-          const { buildTonOrderPayload, buildJettonOrderPayload } = await import('./services/open4devOrderBook');
+          // Step 2: Loop to build all order payloads
 
-          let orderResult: { to: string; amountNano: string; payloadBoc: string };
-
-          if (activePool.direction === 'ton' || fromToken === 'TON') {
-            // Selling TON for jetton
-            orderResult = buildTonOrderPayload({
-              dexVaultTonAddress: activePool.dexVaultAddress,
-              sendValueNano: (BigInt(amountRaw) + 100000000n).toString(),
-              orderAmountNano: amountRaw,
-              priceRateNano,
-              slippage: slippageValue,
-              toJettonMinter: activePool.jettonMinter,
-              providerFeeAddress: activePool.providerFeeAddress,
-              feeNum: activePool.feeNum,
-              feeDenom: activePool.feeDenom,
-              matcherFeeNum: activePool.matcherFeeNum,
-              matcherFeeDenom: activePool.matcherFeeDenom,
-              oppositeVaultAddress: activePool.oppositeVaultAddress,
-            });
-          } else {
-            // Selling jetton for TON
-            // Need jetton wallet address for the user
+          // Fetch jetton balances ONCE if any order sells a jetton (optimization)
+          const needsJettonBalances = orders.some(o => o.fromToken !== 'TON');
+          let jettonBalances: any[] | null = null;
+          if (needsJettonBalances) {
             const tonapiClient = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
             const jettons = await tonapiClient.getJettonBalances(user.address);
-            // Match by symbol, name, or minter address (handles special chars like USD₮)
-            const fromMinter = DEX_JETTON_MINTERS[fromToken] ?? '';
-            const jetton = (jettons.balances || []).find((b: any) =>
-              b.jetton?.symbol?.toUpperCase() === fromToken ||
-              b.jetton?.name?.toUpperCase() === fromToken ||
-              b.jetton?.symbol?.replace(/[^A-Z0-9]/gi, '').toUpperCase() === fromToken ||
-              (fromMinter && b.jetton?.address === fromMinter)
-            );
-            if (!jetton) {
-              return json({ error: `You don't hold ${fromToken} tokens` }, 400);
+            jettonBalances = jettons.balances || [];
+          }
+
+          const messages: Array<{ address: string; amount: string; payload?: string }> = [];
+          const swaps: Array<{ fromToken: string; toToken: string; amount: number; amountRaw: string; price: number; priceRateNano: string; slippage: number; pool: string }> = [];
+
+          for (let i = 0; i < orders.length; i++) {
+            const o = orders[i];
+
+            const fromDecimals = getTokenDecimals(o.fromToken);
+            const toDecimals = getTokenDecimals(o.toToken);
+
+            // Convert human-readable amount to raw units
+            const amountStr = o.amount.toFixed(fromDecimals);
+            const [amountWhole, amountFrac = ''] = amountStr.split('.');
+            const amountRaw = BigInt(amountWhole + amountFrac.padEnd(fromDecimals, '0').slice(0, fromDecimals)).toString();
+
+            const priceRateNano = calculatePriceRate(o.price, toDecimals, fromDecimals).toString();
+
+            // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
+            const effectiveSlippage = 1 + 1 + 2; // 4%
+            const slippageValue = Number(calculateSlippage(effectiveSlippage));
+
+            const activePool = getDexPair(o.fromToken, o.toToken);
+            if (!activePool) {
+              return json({ error: `Order ${i + 1}: Pair ${o.fromToken}/${o.toToken} not found. Available tokens: ${Object.keys(DEX_VAULTS).join(', ')}` }, 404);
             }
 
-            orderResult = buildJettonOrderPayload({
-              jettonWalletAddress: jetton.wallet_address?.address ?? jetton.wallet_address ?? jetton.jetton?.address,
-              attachedTonAmountNano: '150000000', // 0.15 TON for gas
-              jettonAmountNano: amountRaw,
-              dexVaultAddress: activePool.dexVaultAddress,
-              ownerAddress: user.address,
-              forwardTonAmountNano: '100000000', // 0.1 TON forward
+            let orderResult: { to: string; amountNano: string; payloadBoc: string };
+
+            if (activePool.direction === 'ton' || o.fromToken === 'TON') {
+              // Selling TON for jetton
+              orderResult = buildTonOrderPayload({
+                dexVaultTonAddress: activePool.dexVaultAddress,
+                sendValueNano: (BigInt(amountRaw) + 100000000n).toString(),
+                orderAmountNano: amountRaw,
+                priceRateNano,
+                slippage: slippageValue,
+                toJettonMinter: activePool.jettonMinter,
+                providerFeeAddress: activePool.providerFeeAddress,
+                feeNum: activePool.feeNum,
+                feeDenom: activePool.feeDenom,
+                matcherFeeNum: activePool.matcherFeeNum,
+                matcherFeeDenom: activePool.matcherFeeDenom,
+                oppositeVaultAddress: activePool.oppositeVaultAddress,
+              });
+            } else {
+              // Selling jetton for TON
+              const fromMinter = DEX_JETTON_MINTERS[o.fromToken] ?? '';
+              const jetton = (jettonBalances || []).find((b: any) =>
+                b.jetton?.symbol?.toUpperCase() === o.fromToken ||
+                b.jetton?.name?.toUpperCase() === o.fromToken ||
+                b.jetton?.symbol?.replace(/[^A-Z0-9]/gi, '').toUpperCase() === o.fromToken ||
+                (fromMinter && b.jetton?.address === fromMinter)
+              );
+              if (!jetton) {
+                return json({ error: `Order ${i + 1}: You don't hold ${o.fromToken} tokens` }, 400);
+              }
+
+              orderResult = buildJettonOrderPayload({
+                jettonWalletAddress: jetton.wallet_address?.address ?? jetton.wallet_address ?? jetton.jetton?.address,
+                attachedTonAmountNano: '150000000', // 0.15 TON for gas
+                jettonAmountNano: amountRaw,
+                dexVaultAddress: activePool.dexVaultAddress,
+                ownerAddress: user.address,
+                forwardTonAmountNano: '100000000', // 0.1 TON forward
+                priceRateNano,
+                slippage: slippageValue,
+                toJettonMinter: activePool.jettonMinter,
+                providerFeeAddress: activePool.providerFeeAddress,
+                feeNum: activePool.feeNum,
+                feeDenom: activePool.feeDenom,
+                matcherFeeNum: activePool.matcherFeeNum,
+                matcherFeeDenom: activePool.matcherFeeDenom,
+                oppositeVaultAddress: activePool.oppositeVaultAddress,
+              });
+            }
+
+            messages.push({
+              address: orderResult.to,
+              amount: orderResult.amountNano,
+              payload: orderResult.payloadBoc,
+            });
+
+            swaps.push({
+              fromToken: o.fromToken,
+              toToken: o.toToken,
+              amount: o.amount,
+              amountRaw,
+              price: o.price,
               priceRateNano,
-              slippage: slippageValue,
-              toJettonMinter: activePool.jettonMinter,
-              providerFeeAddress: activePool.providerFeeAddress,
-              feeNum: activePool.feeNum,
-              feeDenom: activePool.feeDenom,
-              matcherFeeNum: activePool.matcherFeeNum,
-              matcherFeeDenom: activePool.matcherFeeDenom,
-              oppositeVaultAddress: activePool.oppositeVaultAddress,
+              slippage: effectiveSlippage,
+              pool: activePool.pair,
             });
           }
 
-          // Create safe transfer request
-          const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, orderResult.to, orderResult.amountNano, orderResult.payloadBoc);
+          // Step 3: Create pending request and batch-send
+          const totalNano = messages.reduce((sum, m) => (BigInt(sum) + BigInt(m.amount)).toString(), '0');
+          const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, messages[0].address, totalNano);
 
-          // Auto-push to wallet
+          // Push all messages as one transaction via bridgeSendMessages
           try {
             const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
             if (tcSession) {
-              await bridgeSendTransaction(tcSession, req.id, orderResult.to, orderResult.amountNano, orderResult.payloadBoc);
+              await bridgeSendMessages(tcSession, req.id, messages);
             }
           } catch {}
 
           return json({
             ...req,
-            swap: { fromToken, toToken, amount, amountRaw, price, priceRateNano, slippage: effectiveSlippage, pool: activePool.pair },
+            orders: swaps,
+            // Backward-compat: include `swap` field when single order
+            ...(swaps.length === 1 ? { swap: swaps[0] } : {}),
           });
         } catch (e: any) {
           return json({ error: e.message }, 400);
