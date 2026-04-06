@@ -297,9 +297,9 @@ function getDexPair(fromToken: string, toToken: string): DexPairConfig | null {
     oppositeVaultAddress: toVault,
     jettonMinter: DEX_JETTON_MINTERS[to] ?? '',  // target token minter (what we're buying)
     providerFeeAddress: DEX_DEFAULT_FEE_ADDRESS,
-    feeNum: 100,
+    feeNum: 20,
     feeDenom: 10000,
-    matcherFeeNum: 200,
+    matcherFeeNum: 20,
     matcherFeeDenom: 10000,
     slippage: DEX_DEFAULT_SLIPPAGE,
   };
@@ -1629,7 +1629,7 @@ const handler: ExportedHandler<Env> = {
         try {
         // Step 1: Normalize input into orders array
         // Accept either { orders: [...] } or flat { fromToken, toToken, amount, price }
-        type OrderInput = { fromToken: string; toToken: string; amount: number; price: number };
+        type OrderInput = { fromToken: string; toToken: string; amount: number; price: number; slippage?: number };
         let orders: OrderInput[];
 
         if (Array.isArray(body.orders)) {
@@ -1641,7 +1641,7 @@ const handler: ExportedHandler<Env> = {
             if (!fromToken || !toToken || !amount || isNaN(amount) || amount <= 0 || !price || isNaN(price) || price <= 0) {
               throw new Error(`Order ${idx + 1}: Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)`);
             }
-            return { fromToken, toToken, amount, price };
+            return { fromToken, toToken, amount, price, slippage: o.slippage ? Number(o.slippage) : undefined };
           });
         } else {
           const fromToken = (body.fromToken as string || '').toUpperCase();
@@ -1651,7 +1651,7 @@ const handler: ExportedHandler<Env> = {
           if (!fromToken || !toToken || !amount || isNaN(amount) || amount <= 0 || !price || isNaN(price) || price <= 0) {
             throw new Error('Order 1: Missing required fields: fromToken, toToken, amount (human-readable, e.g. 10000), price (human-readable, e.g. 0.000289)');
           }
-          orders = [{ fromToken, toToken, amount, price }];
+          orders = [{ fromToken, toToken, amount, price, slippage: body.slippage ? Number(body.slippage) : undefined }];
         }
 
         if (!orders.length) {
@@ -1671,15 +1671,18 @@ const handler: ExportedHandler<Env> = {
           const messages: Array<{ address: string; amount: string; payload?: string }> = [];
           const swaps: Array<{ fromToken: string; toToken: string; amount: number; amountRaw: string; price: number; priceRateNano: string; slippage: number; pool: string }> = [];
 
-          // Slippage must include fees: user slippage (1%) + platform fee (1%) + matcher fee (2%) = 4%
-          const effectiveSlippage = 1 + 1 + 2; // 4%
-          const slippageValue = Number(calculateSlippage(effectiveSlippage));
-
           // Unique queryId per order so jetton wallet doesn't deduplicate
           const batchTimestamp = BigInt(Date.now());
 
           for (let i = 0; i < orders.length; i++) {
             const o = orders[i];
+
+            // Slippage: user-provided or default 1%, plus platform fee (0.2%) + matcher fee (0.2%)
+            const platformFee = 0.2;
+            const matcherFee = 0.2;
+            const userSlippage = o.slippage ?? 1;
+            const effectiveSlippage = userSlippage + platformFee + matcherFee;
+            const slippageValue = Number(calculateSlippage(effectiveSlippage));
 
             const fromDecimals = getTokenDecimals(o.fromToken);
             const toDecimals = getTokenDecimals(o.toToken);
