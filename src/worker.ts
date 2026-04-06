@@ -1675,6 +1675,9 @@ const handler: ExportedHandler<Env> = {
           const effectiveSlippage = 1 + 1 + 2; // 4%
           const slippageValue = Number(calculateSlippage(effectiveSlippage));
 
+          // Unique queryId per order so jetton wallet doesn't deduplicate
+          const batchTimestamp = BigInt(Date.now());
+
           for (let i = 0; i < orders.length; i++) {
             const o = orders[i];
 
@@ -1710,6 +1713,7 @@ const handler: ExportedHandler<Env> = {
                 matcherFeeNum: activePool.matcherFeeNum,
                 matcherFeeDenom: activePool.matcherFeeDenom,
                 oppositeVaultAddress: activePool.oppositeVaultAddress,
+                createdAt: Math.floor(Date.now() / 1000) + i, // unique per order
               });
             } else {
               // Selling jetton for TON
@@ -1740,6 +1744,7 @@ const handler: ExportedHandler<Env> = {
                 matcherFeeNum: activePool.matcherFeeNum,
                 matcherFeeDenom: activePool.matcherFeeDenom,
                 oppositeVaultAddress: activePool.oppositeVaultAddress,
+                queryId: (batchTimestamp * 1000n + BigInt(i)).toString(),
               });
             }
 
