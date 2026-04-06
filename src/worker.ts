@@ -1766,22 +1766,30 @@ const handler: ExportedHandler<Env> = {
             });
           }
 
-          // Step 3: Create pending request and batch-send
-          const totalNano = messages.reduce((sum, m) => (BigInt(sum) + BigInt(m.amount)).toString(), '0');
-          const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, messages[0].address, totalNano);
+          // Step 3: Create separate pending requests per order
+          // DEX vaults reject multiple orders from the same sender in one block,
+          // so each order must be a separate TonConnect transaction.
+          const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
+          const requests: PendingRequest[] = [];
 
-          // Push all messages as one transaction via bridgeSendMessages
-          try {
-            const tcSession = await loadTcSession(env.PENDING_STORE, user.address);
-            if (tcSession) {
-              await bridgeSendMessages(tcSession, req.id, messages);
+          for (let i = 0; i < messages.length; i++) {
+            const m = messages[i];
+            const req = await kvCreatePending(env.PENDING_STORE, user.sessionId, user.address, m.address, m.amount, m.payload);
+            requests.push(req);
+
+            // Push to wallet — only the first immediately, rest queued for client to poll
+            if (i === 0 && tcSession) {
+              try {
+                await bridgeSendTransaction(tcSession, req.id, m.address, m.amount, m.payload);
+              } catch (e) {
+                console.error('Bridge send failed for order', i, e);
+              }
             }
-          } catch (e) {
-            console.error('Bridge batch send failed:', e);
           }
 
           return json({
-            ...req,
+            ...requests[0],
+            pendingIds: requests.map(r => r.id),
             orders: swaps,
             // Backward-compat: include `swap` field when single order
             ...(swaps.length === 1 ? { swap: swaps[0] } : {}),
