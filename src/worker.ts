@@ -1808,8 +1808,8 @@ const handler: ExportedHandler<Env> = {
         if (!transfers || !Array.isArray(transfers) || !transfers.length) {
           return json({ error: 'Missing transfers array' }, 400);
         }
-        if (transfers.length > 4) {
-          return json({ error: 'Max 4 transfers per batch (v4 wallet limit). Use agent_wallet.batch_transfer for more.' }, 400);
+        if (transfers.length > 255) {
+          return json({ error: 'Max 255 transfers per batch.' }, 400);
         }
 
         // Build messages for TON Connect
