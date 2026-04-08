@@ -1657,6 +1657,18 @@ const handler: ExportedHandler<Env> = {
         if (!orders.length) {
           return json({ error: 'At least one order is required' }, 400);
         }
+
+        // Detect wallet version to enforce batch limit
+        if (orders.length > 1) {
+          const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+          const account = await client.getAccount(user.address);
+          const interfaces: string[] = account.interfaces ?? [];
+          const isV5 = interfaces.some((i: string) => i.startsWith('wallet_v5'));
+          const maxBatch = isV5 ? 255 : 4;
+          if (orders.length > maxBatch) {
+            return json({ error: `Max ${maxBatch} orders per batch (${isV5 ? 'v5' : 'v4'} wallet).${!isV5 ? ' Upgrade to v5 for up to 255.' : ''}` }, 404);
+          }
+        }
           // Step 2: Loop to build all order payloads
 
           // Fetch jetton balances ONCE if any order sells a jetton (optimization)
@@ -1808,8 +1820,16 @@ const handler: ExportedHandler<Env> = {
         if (!transfers || !Array.isArray(transfers) || !transfers.length) {
           return json({ error: 'Missing transfers array' }, 400);
         }
-        if (transfers.length > 255) {
-          return json({ error: 'Max 255 transfers per batch.' }, 400);
+
+        // Detect wallet version to enforce correct batch limit
+        const client = createTonApiClient(env.TONAPI_BASE_URL ?? 'https://tonapi.io', env.TONAPI_KEY);
+        const account = await client.getAccount(user.address);
+        const interfaces: string[] = account.interfaces ?? [];
+        const isV5 = interfaces.some((i: string) => i.startsWith('wallet_v5'));
+        const maxBatch = isV5 ? 255 : 4;
+
+        if (transfers.length > maxBatch) {
+          return json({ error: `Max ${maxBatch} transfers per batch (${isV5 ? 'v5' : 'v4'} wallet).${!isV5 ? ' Upgrade to v5 for up to 255.' : ''}` }, 400);
         }
 
         // Build messages for TON Connect
@@ -1841,7 +1861,7 @@ const handler: ExportedHandler<Env> = {
 
         return json({
           ...req,
-          batch: { count: transfers.length, totalNano },
+          batch: { count: transfers.length, totalNano, walletVersion: isV5 ? 'v5' : 'v4', maxBatch },
         });
       }
 
